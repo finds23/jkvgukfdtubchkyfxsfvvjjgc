@@ -1,5 +1,5 @@
 "use strict";
-// providers/calor.js
+// providers/fds.js
 // Provider Nuvio (sitio basado en Blogger)
 //
 // El sitio es un blog de Blogger: cada película es una entrada y cada
@@ -61,7 +61,7 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
         if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
     }
 };
-var PROVIDER_NAME = "Calor"; // nombre visible en los logs y en la lista de streams
+var PROVIDER_NAME = "fds"; // nombre visible en los logs y en la lista de streams
 var SITE_BASE = atob("aHR0cHM6Ly93d3cuZnVlZ29jaW5lLmNvbQ==");
 var TMDB_API_KEY = "56db0ec297530920213e1503706b81ff";
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
