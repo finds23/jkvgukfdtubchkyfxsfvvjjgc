@@ -1,0 +1,22 @@
+{
+  "name": "fds",
+  "version": "1.0.2",
+  "scrapers": [
+    {
+      "id": "fds",
+      "name": "fds",
+      "description": "fds",
+      "version": "1.0.2",
+      "author": "-",
+      "supportedTypes": [
+        "movie",
+        "tv"
+      ],
+      "filename": "providers/fds.js",
+      "enabled": true,
+      "contentLanguage": [
+        "es"
+      ]
+    }
+  ]
+}
