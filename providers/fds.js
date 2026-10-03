@@ -458,23 +458,42 @@ function vidsCollectCandidates(html, embedUrl) {
     });
     return list;
 }
-function vidsIsPlayable(url, headers) {
-    // Estados: "ok" (2xx/206), "dead" (404/410: el archivo no existe) o "unknown" (403, 416, error de red...:
-    // el servidor rechazo la prueba pero eso no demuestra que el archivo no exista)
+function vidsAttempt(url, headers, method, range) {
     var h = {};
     for (var k in headers)
         h[k] = headers[k];
-    h["Range"] = "bytes=0-1";
-    return fetch(url, { headers: h }).then(function (r) {
-        console.log("[VST] Comprobando " + url + " -> HTTP " + r.status);
-        if (r.ok || r.status === 206)
-            return { state: "ok", status: r.status };
-        if (r.status === 404 || r.status === 410)
-            return { state: "dead", status: r.status };
-        return { state: "unknown", status: r.status };
+    if (range)
+        h["Range"] = "bytes=0-1";
+    return fetch(url, { method: method, headers: h }).then(function (r) {
+        var ct = "";
+        try {
+            ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
+        }
+        catch (_) { }
+        return { status: r.status, ok: r.ok || r.status === 206, ct: ct };
     }).catch(function (e) {
-        console.warn("[VST] No se pudo comprobar " + url + ": " + e.message);
-        return { state: "unknown", status: "red" };
+        return { status: "red", ok: false, ct: "" };
+    });
+}
+function vidsIsPlayable(url, headers) {
+    // Estados: "ok" (2xx/206 con tipo de video), "dead" (404/410: no existe) o "unknown" (403, 416, status 0, error de red...)
+    return vidsAttempt(url, headers, "HEAD", false).then(function (a) {
+        if (a.ok || a.status === 404 || a.status === 410)
+            return a;
+        return vidsAttempt(url, headers, "GET", true).then(function (b) {
+            b.head = a.status;
+            return b;
+        });
+    }).then(function (r) {
+        console.log("[VST] Comprobando " + url + " -> HTTP " + r.status + (r.head !== undefined ? " (HEAD " + r.head + ")" : "") + (r.ct ? " " + r.ct : ""));
+        var isHtml = /text\/html/i.test(r.ct);
+        var state = "unknown";
+        if (r.ok && !isHtml)
+            state = "ok";
+        else if (r.status === 404 || r.status === 410)
+            state = "dead";
+        var detail = (r.head !== undefined ? "HEAD " + r.head + " / GET " + r.status : "" + r.status) + (r.ct ? " " + r.ct.split(";")[0] : "");
+        return { state: state, status: detail };
     });
 }
 function vidsSlug(s) {
@@ -551,12 +570,13 @@ function extractVids(embedUrl, ctx) {
         var url = found.url;
         console.log("[VST] Video: " + url + " (" + found.note + ")");
         var isHls = /\.m3u8(\?|$)/i.test(url);
-        return {
-            url: url,
-            headers: headers,
-            type: isHls ? "hls" : "mp4",
-            note: "VST: " + found.note + " \u00B7 " + url.replace(/^https?:\/\/[^\/]+/, "").slice(-45)
-        };
+        var shortUrl = url.replace(/^https?:\/\/[^\/]+/, "").slice(-45);
+        var type = isHls ? "hls" : "mp4";
+        // Dos variantes: A sin cabeceras (como abrir el enlace suelto en el navegador) y B con el Referer del embed
+        return [
+            { url: url, headers: {}, type: type, note: "VST A (sin cabeceras): " + found.note + " \u00B7 " + shortUrl },
+            { url: url, headers: { "Referer": embedUrl, "User-Agent": UA }, type: type, note: "VST B (con Referer): " + found.note + " \u00B7 " + shortUrl }
+        ];
     });
 }
 /**
@@ -801,8 +821,10 @@ exports.getStreams = function (tmdbId, type, season, episode) {
                                         return [4 /*yield*/, source.extract(server.url, { titles: info.titles, year: info.year, original: info.original })];
                                     case 2:
                                         resolved = _a.sent();
-                                        label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang)).concat(resolved.note ? "\n" + resolved.note : "");
-                                        return [2 /*return*/, __assign({ name: PROVIDER_NAME, title: "", url: resolved.url, quality: label, headers: resolved.headers }, (resolved.type ? { type: resolved.type } : {}))];
+                                        return [2 /*return*/, (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
+                                                var label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang)).concat(rv.note ? "\n" + rv.note : "");
+                                                return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
+                                            })];
                                     case 3:
                                         e_5 = _a.sent();
                                         console.warn("[".concat(source.label, "] Fall\u00F3 resolviendo un servidor: ").concat(e_5.message));
@@ -813,7 +835,7 @@ exports.getStreams = function (tmdbId, type, season, episode) {
                         }); }))];
                 case 7:
                     results = _a.sent();
-                    final = results.filter(Boolean);
+                    final = results.filter(Boolean).reduce(function (acc, item) { return acc.concat(item); }, []);
                     console.log("[".concat(PROVIDER_NAME, "] \u2713 ").concat(final.length, " streams devueltos"));
                     return [2 /*return*/, final];
                 case 8:
