@@ -169,7 +169,7 @@ function getTMDBTitles(tmdbId, type) {
                     base = es || en;
                     dateStr = base.release_date || base.first_air_date;
                     year = dateStr ? new Date(dateStr).getFullYear() : undefined;
-                    return [2 /*return*/, { titles: titles, year: year }];
+                    return [2 /*return*/, { titles: titles, year: year, original: (en && (en.original_title || en.original_name)) || base.original_title || base.original_name }];
             }
         });
     });
@@ -459,16 +459,22 @@ function vidsCollectCandidates(html, embedUrl) {
     return list;
 }
 function vidsIsPlayable(url, headers) {
+    // Devuelve "ok" (2xx/206), "dead" (404/410: el archivo no existe) o "unknown" (403, 416, error de red...:
+    // el servidor rechazo la prueba pero eso no demuestra que el archivo no exista)
     var h = {};
     for (var k in headers)
         h[k] = headers[k];
     h["Range"] = "bytes=0-1";
     return fetch(url, { headers: h }).then(function (r) {
         console.log("[VST] Comprobando " + url + " -> HTTP " + r.status);
-        return r.ok || r.status === 206;
+        if (r.ok || r.status === 206)
+            return "ok";
+        if (r.status === 404 || r.status === 410)
+            return "dead";
+        return "unknown";
     }).catch(function (e) {
         console.warn("[VST] No se pudo comprobar " + url + ": " + e.message);
-        return false;
+        return "unknown";
     });
 }
 function vidsSlug(s) {
@@ -508,6 +514,9 @@ function extractVids(embedUrl, ctx) {
             var tm = String(html || "").match(/<title[^>]*>([^<]+)<\/title>/i);
             if (tm)
                 addName(tm[1].replace(/\.(mp4|mkv)$/i, ""));
+            // vids.st nombra el archivo con el titulo ORIGINAL; ese va primero
+            if (ctx && ctx.original)
+                addName(ctx.original);
             var titles = (ctx && ctx.titles) || [];
             for (var i = 0; i < titles.length && i < 5; i++)
                 addName(titles[i]);
@@ -523,10 +532,16 @@ function extractVids(embedUrl, ctx) {
         candidates = candidates.filter(function (u) { return seen[u] ? false : (seen[u] = true); }).slice(0, 14);
         console.log("[VST] Candidatas (" + candidates.length + "): " + candidates.slice(0, 8).join(" | "));
         // Se comprueban todas a la vez y se toma la primera valida segun el orden
-        return Promise.all(candidates.map(function (u) { return vidsIsPlayable(u, headers); })).then(function (oks) {
-            for (var j = 0; j < candidates.length; j++)
-                if (oks[j])
+        return Promise.all(candidates.map(function (u) { return vidsIsPlayable(u, headers); })).then(function (states) {
+            var j;
+            for (j = 0; j < candidates.length; j++)
+                if (states[j] === "ok")
                     return candidates[j];
+            for (j = 0; j < candidates.length; j++)
+                if (states[j] === "unknown") {
+                    console.warn("[VST] Ninguna candidata confirmada; uso la primera que no dio 404: " + candidates[j]);
+                    return candidates[j];
+                }
             return null;
         });
     })
@@ -781,7 +796,7 @@ exports.getStreams = function (tmdbId, type, season, episode) {
                                         _a.label = 1;
                                     case 1:
                                         _a.trys.push([1, 3, , 4]);
-                                        return [4 /*yield*/, source.extract(server.url, { titles: info.titles, year: info.year })];
+                                        return [4 /*yield*/, source.extract(server.url, { titles: info.titles, year: info.year, original: info.original })];
                                     case 2:
                                         resolved = _a.sent();
                                         label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang));
