@@ -429,55 +429,117 @@ function detectSource(url) {
 // ─────────────────────────────────────────────
 /**
  * VST (https://vids.st/e/<id>)
- * El reproductor termina pidiendo un MP4 directo:
- *   https://vids.st/storage/uploads/video<id>/remote.mp4
- * Primero se intenta leerlo del HTML del embed; si no aparece, se arma con el ID.
+ * 1) Se buscan en el HTML del embed todas las URLs de video (.mp4 / .m3u8), de cualquier host.
+ * 2) Si no hay ninguna, se prueba la URL construida con el ID: /storage/uploads/video<id>/remote.mp4
+ * 3) Cada candidata se COMPRUEBA antes de devolverla; si da 404 se descarta (asi no sale un enlace muerto en Nuvio).
  */
-function extractVids(embedUrl) {
-    return __awaiter(this, void 0, void 0, function () {
-        var origin, idMatch, mp4, resp, html, re, m, candidate, e_2;
-        return __generator(this, function (_a) {
-            switch (_a.label) {
-                case 0:
-                    origin = getOrigin(embedUrl);
-                    idMatch = embedUrl.match(/\/e\/([^\/?#]+)/);
-                    mp4 = idMatch ? "".concat(origin, "/storage/uploads/video").concat(idMatch[1], "/remote.mp4") : null;
-                    _a.label = 1;
-                case 1:
-                    _a.trys.push([1, 5, , 6]);
-                    return [4 /*yield*/, fetch(embedUrl, { headers: { "User-Agent": UA, "Referer": "".concat(origin, "/") } })];
-                case 2:
-                    resp = _a.sent();
-                    if (!resp.ok) return [3 /*break*/, 4];
-                    return [4 /*yield*/, resp.text()];
-                case 3:
-                    html = _a.sent();
-                    re = /https?:\\?\/\\?\/[^"'\s<>\\]+(?:\\\/[^"'\s<>\\]+)*\.mp4/g;
-                    m = void 0;
-                    while ((m = re.exec(html)) !== null) {
-                        candidate = m[0].replace(/\\\//g, "/");
-                        if (getHost(candidate) === getHost(embedUrl)) {
-                            mp4 = candidate;
-                            break;
-                        }
-                    }
-                    _a.label = 4;
-                case 4: return [3 /*break*/, 6];
-                case 5:
-                    e_2 = _a.sent();
-                    console.warn("[VST] No se pudo leer el embed, uso URL construida: ".concat(e_2.message));
-                    return [3 /*break*/, 6];
-                case 6:
-                    if (!mp4)
-                        throw Error("VST: no se pudo determinar la URL del MP4");
-                    console.log("[VST] MP4: ".concat(mp4));
-                    return [2 /*return*/, {
-                            url: mp4,
-                            headers: { "Referer": "".concat(origin, "/"), "User-Agent": UA },
-                            type: "mp4"
-                        }];
-            }
+function vidsCollectCandidates(html, embedUrl) {
+    var text = String(html || "")
+        .replace(/\\u002F/gi, "/")
+        .replace(/\\\//g, "/")
+        .replace(/&amp;/g, "&");
+    var re = /https?:\/\/[^"'\s<>\\()]+?\.(?:mp4|m3u8)(?:\?[^"'\s<>\\()]*)?/gi;
+    var seen = {};
+    var list = [];
+    var m;
+    while ((m = re.exec(text)) !== null) {
+        var u = m[0];
+        if (seen[u])
+            continue;
+        seen[u] = true;
+        list.push(u);
+    }
+    var host = getHost(embedUrl);
+    // Primero las del mismo host del embed (o de un subdominio), despues el resto
+    list.sort(function (a, b) {
+        var sa = getHost(a).indexOf(host.replace(/^www\./, "")) !== -1 ? 0 : 1;
+        var sb = getHost(b).indexOf(host.replace(/^www\./, "")) !== -1 ? 0 : 1;
+        return sa - sb;
+    });
+    return list;
+}
+function vidsIsPlayable(url, headers) {
+    var h = {};
+    for (var k in headers)
+        h[k] = headers[k];
+    h["Range"] = "bytes=0-1";
+    return fetch(url, { headers: h }).then(function (r) {
+        console.log("[VST] Comprobando " + url + " -> HTTP " + r.status);
+        return r.ok || r.status === 206;
+    }).catch(function (e) {
+        console.warn("[VST] No se pudo comprobar " + url + ": " + e.message);
+        return false;
+    });
+}
+function vidsSlug(s) {
+    var out = String(s || "");
+    try {
+        out = out.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    }
+    catch (_) { }
+    return out.toLowerCase().replace(/['\u2019`]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function extractVids(embedUrl, ctx) {
+    var origin = getOrigin(embedUrl);
+    var idMatch = embedUrl.match(/\/e\/([^\/?#]+)/);
+    var id = idMatch ? idMatch[1] : null;
+    var headers = { "Referer": origin + "/", "User-Agent": UA };
+    return fetch(embedUrl, { headers: headers })
+        .then(function (resp) { return resp.ok ? resp.text() : ""; })
+        .catch(function (e) {
+        console.warn("[VST] No se pudo leer el embed: " + e.message);
+        return "";
+    })
+        .then(function (html) {
+        // 1) URLs de video que aparezcan en el HTML
+        var candidates = vidsCollectCandidates(html, embedUrl);
+        // 2) vids.st guarda el archivo como /storage/uploads/video<ID>/<titulo-en-slug>-<año>.mp4
+        if (id) {
+            var base = origin + "/storage/uploads/video" + id + "/";
+            var names = [];
+            var seenName = {};
+            var addName = function (t) {
+                var slug = vidsSlug(t);
+                if (slug && !seenName[slug]) {
+                    seenName[slug] = true;
+                    names.push(slug);
+                }
+            };
+            var tm = String(html || "").match(/<title[^>]*>([^<]+)<\/title>/i);
+            if (tm)
+                addName(tm[1].replace(/\.(mp4|mkv)$/i, ""));
+            var titles = (ctx && ctx.titles) || [];
+            for (var i = 0; i < titles.length && i < 5; i++)
+                addName(titles[i]);
+            var year = ctx && ctx.year;
+            names.forEach(function (slug) {
+                if (year)
+                    candidates.push(base + slug + "-" + year + ".mp4");
+                candidates.push(base + slug + ".mp4");
+            });
+            candidates.push(base + "remote.mp4");
+        }
+        var seen = {};
+        candidates = candidates.filter(function (u) { return seen[u] ? false : (seen[u] = true); }).slice(0, 14);
+        console.log("[VST] Candidatas (" + candidates.length + "): " + candidates.slice(0, 8).join(" | "));
+        // Se comprueban todas a la vez y se toma la primera valida segun el orden
+        return Promise.all(candidates.map(function (u) { return vidsIsPlayable(u, headers); })).then(function (oks) {
+            for (var j = 0; j < candidates.length; j++)
+                if (oks[j])
+                    return candidates[j];
+            return null;
         });
+    })
+        .then(function (url) {
+        if (!url)
+            throw Error("VST: ninguna URL de video respondio (404/403). Embed: " + embedUrl);
+        console.log("[VST] Video: " + url);
+        var isHls = /\.m3u8(\?|$)/i.test(url);
+        return {
+            url: url,
+            headers: headers,
+            type: isHls ? "hls" : "mp4"
+        };
     });
 }
 /**
@@ -719,7 +781,7 @@ exports.getStreams = function (tmdbId, type, season, episode) {
                                         _a.label = 1;
                                     case 1:
                                         _a.trys.push([1, 3, , 4]);
-                                        return [4 /*yield*/, source.extract(server.url)];
+                                        return [4 /*yield*/, source.extract(server.url, { titles: info.titles, year: info.year })];
                                     case 2:
                                         resolved = _a.sent();
                                         label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang));
