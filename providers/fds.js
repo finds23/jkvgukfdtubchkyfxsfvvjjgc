@@ -470,30 +470,35 @@ function vidsAttempt(url, headers, method, range) {
             ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
         }
         catch (_) { }
-        return { status: r.status, ok: r.ok || r.status === 206, ct: ct };
+        return { status: r.status, ok: r.ok || r.status === 206, ct: ct, type: r.type || "", redirected: !!r.redirected, finalUrl: r.url || "" };
     }).catch(function (e) {
-        return { status: "red", ok: false, ct: "" };
+        return { status: "red", ok: false, ct: "", type: "", redirected: false, finalUrl: "" };
     });
+}
+function vidsTag(r) {
+    return r.status + (r.status === 0 && r.type ? "(" + r.type + ")" : "");
 }
 function vidsIsPlayable(url, headers) {
     // Estados: "ok" (2xx/206 con tipo de video), "dead" (404/410: no existe) o "unknown" (403, 416, status 0, error de red...)
     return vidsAttempt(url, headers, "HEAD", false).then(function (a) {
         if (a.ok || a.status === 404 || a.status === 410)
-            return a;
+            return { a: a };
         return vidsAttempt(url, headers, "GET", true).then(function (b) {
-            b.head = a.status;
-            return b;
+            if (b.ok || b.status === 404 || b.status === 410)
+                return { a: a, b: b };
+            // Tambien se prueba sin ninguna cabecera, por si alguna de las nuestras molesta
+            return vidsAttempt(url, {}, "HEAD", false).then(function (p) { return { a: a, b: b, p: p }; });
         });
-    }).then(function (r) {
-        console.log("[VST] Comprobando " + url + " -> HTTP " + r.status + (r.head !== undefined ? " (HEAD " + r.head + ")" : "") + (r.ct ? " " + r.ct : ""));
-        var isHtml = /text\/html/i.test(r.ct);
-        var state = "unknown";
-        if (r.ok && !isHtml)
-            state = "ok";
-        else if (r.status === 404 || r.status === 410)
-            state = "dead";
-        var detail = (r.head !== undefined ? "HEAD " + r.head + " / GET " + r.status : "" + r.status) + (r.ct ? " " + r.ct.split(";")[0] : "");
-        return { state: state, status: detail };
+    }).then(function (x) {
+        var all = [x.a, x.b, x.p].filter(Boolean);
+        var best = all[all.length - 1];
+        var good = all.filter(function (r) { return r.ok && !/text\/html/i.test(r.ct); })[0];
+        var dead = all.filter(function (r) { return r.status === 404 || r.status === 410; })[0];
+        var redirect = all.filter(function (r) { return r.redirected && r.finalUrl && r.finalUrl !== url; })[0];
+        console.log("[VST] Comprobando " + url + " -> HEAD " + vidsTag(x.a) + (x.b ? " / GET " + vidsTag(x.b) : "") + (x.p ? " / plano " + vidsTag(x.p) : "") + (redirect ? " | redirige a " + redirect.finalUrl : ""));
+        var detail = "H" + vidsTag(x.a) + (x.b ? " G" + vidsTag(x.b) : "") + (x.p ? " P" + vidsTag(x.p) : "") + (good && good.ct ? " " + good.ct.split(";")[0] : "");
+        var state = good ? "ok" : (dead ? "dead" : "unknown");
+        return { state: state, status: detail, finalUrl: redirect ? redirect.finalUrl : "" };
     });
 }
 function vidsSlug(s) {
@@ -509,9 +514,14 @@ function extractVids(embedUrl, ctx) {
     var idMatch = embedUrl.match(/\/e\/([^\/?#]+)/);
     var id = idMatch ? idMatch[1] : null;
     var headers = { "Referer": origin + "/", "User-Agent": UA };
+    var embedNote = "embed ?";
     return fetch(embedUrl, { headers: headers })
-        .then(function (resp) { return resp.ok ? resp.text() : ""; })
+        .then(function (resp) {
+        embedNote = "embed " + resp.status;
+        return resp.ok ? resp.text() : "";
+    })
         .catch(function (e) {
+        embedNote = "embed sin acceso";
         console.warn("[VST] No se pudo leer el embed: " + e.message);
         return "";
     })
@@ -555,11 +565,11 @@ function extractVids(embedUrl, ctx) {
             var j;
             for (j = 0; j < candidates.length; j++)
                 if (states[j].state === "ok")
-                    return { url: candidates[j], note: "ok " + states[j].status };
+                    return { url: candidates[j], note: "ok " + states[j].status, finalUrl: states[j].finalUrl };
             for (j = 0; j < candidates.length; j++)
                 if (states[j].state === "unknown") {
                     console.warn("[VST] Ninguna candidata confirmada; uso la primera que no dio 404: " + candidates[j]);
-                    return { url: candidates[j], note: "sin confirmar " + states[j].status };
+                    return { url: candidates[j], note: "sin confirmar " + states[j].status, finalUrl: states[j].finalUrl };
                 }
             return null;
         });
@@ -572,11 +582,17 @@ function extractVids(embedUrl, ctx) {
         var isHls = /\.m3u8(\?|$)/i.test(url);
         var shortUrl = url.replace(/^https?:\/\/[^\/]+/, "").slice(-45);
         var type = isHls ? "hls" : "mp4";
-        // Dos variantes: A sin cabeceras (como abrir el enlace suelto en el navegador) y B con el Referer del embed
-        return [
-            { url: url, headers: {}, type: type, note: "VST A (sin cabeceras): " + found.note + " \u00B7 " + shortUrl },
-            { url: url, headers: { "Referer": embedUrl, "User-Agent": UA }, type: type, note: "VST B (con Referer): " + found.note + " \u00B7 " + shortUrl }
+        var diag = found.note + " \u00B7 " + embedNote;
+        var MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36";
+        // Varias variantes para descubrir cual acepta el servidor
+        var out = [
+            { url: url, headers: {}, type: type, note: "VST A (sin cabeceras): " + diag + " \u00B7 " + shortUrl },
+            { url: url, headers: { "Referer": embedUrl, "User-Agent": UA }, type: type, note: "VST B (Referer): " + diag },
+            { url: url, headers: { "Referer": origin + "/", "User-Agent": MOBILE_UA, "Accept": "*/*", "Accept-Language": "es-419,es;q=0.9", "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Site": "same-origin" }, type: type, note: "VST C (navegador movil)" }
         ];
+        if (found.finalUrl)
+            out.push({ url: found.finalUrl, headers: {}, type: type, note: "VST R (URL tras redireccion)" });
+        return out;
     });
 }
 /**
