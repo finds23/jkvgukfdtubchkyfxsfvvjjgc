@@ -72,7 +72,11 @@ var ENABLED_SOURCES = {
     Videro: true, // "VR"   -> videro.my  (HLS vía API pública)
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
-    // Drive (drive.google.com) y US (upns.online) no están soportados.
+    Okru: true, // "OK.RU" -> ok.ru (portado de pelisgo.js, donde funciona)
+    Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
+    Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
+    GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
+    // US (upns.online) no está soportado todavia.
     // UA (unlimplay.com) descartado: agregador con anuncio previo y tokens firmados.
     // LV (loadvid.com) descartado: devuelve el m3u8 como texto tras un token CSRF.
 };
@@ -201,6 +205,7 @@ function entryInfo(entry) {
     return {
         title: (entry.title && entry.title.$t) || "",
         content: (entry.content && entry.content.$t) || "",
+        url: ((entry.link || []).filter(function (l) { return l.rel === "alternate"; })[0] || {}).href || "",
         categories: (entry.category || []).map(function (c) { return c.term; })
     };
 }
@@ -380,6 +385,8 @@ function decodeEmbedUrl(rawUrl) {
             var decoded = atob(b64);
             if (/^https?:\/\//i.test(decoded))
                 return decoded;
+            if (/^\/\/[^\/]/.test(decoded))
+                return "https:" + decoded; // GS: //gscdn.cam/video/embed/<id>
         }
         catch (_) { }
     }
@@ -401,6 +408,8 @@ function parseServerLinks(content) {
             return m ? m[2].trim() : "";
         };
         var url = decodeEmbedUrl(get("url"));
+        if (/^\/\/[^\/]/.test(url))
+            url = "https:" + url; // OK.RU viene como //ok.ru/videoembed/<id>
         if (!url)
             return "continue"; // algunos servidores vienen vacíos
         servers.push({ lang: get("lang"), name: get("name"), quality: get("quality"), url: url });
@@ -419,9 +428,18 @@ function detectSource(url) {
         return "Videro";
     if (host === "playmate.to" || host.endsWith(".playmate.to"))
         return "Playmate";
+    // Google Drive (drive.google.com / docs.google.com / drive.usercontent.google.com)
+    if (driveId(url))
+        return "Drive";
     // FC: https://<algo>.blogspot.com/?player=fluidplayer&...&link=<mp4 codificado>
     if (host.endsWith(".blogspot.com") && /[?&]link=/.test(url))
         return "FC";
+    if (host === "vimeos.net" || host.endsWith(".vimeos.net"))
+        return "Vimeos";
+    if (host === "goodstream.one" || host.endsWith(".goodstream.one") || host === "gscdn.cam" || host.endsWith(".gscdn.cam"))
+        return "GoodStream";
+    if (host === "ok.ru" || host.endsWith(".ok.ru") || host === "odnoklassniki.ru" || host.endsWith(".odnoklassniki.ru"))
+        return "Okru";
     return null;
 }
 // ─────────────────────────────────────────────
@@ -702,6 +720,64 @@ function extractPlaymate(embedUrl) {
         });
     });
 }
+// ─────────────────────────────────────────────
+// Google Drive
+// ─────────────────────────────────────────────
+// Devuelve el ID de archivo de una URL de Drive (o "" si no es de Drive).
+//   https://drive.google.com/file/d/<ID>/preview | /view
+//   https://drive.google.com/open?id=<ID>   |   .../uc?id=<ID>&export=download
+//   https://docs.google.com/file/d/<ID>/preview
+function driveId(url) {
+    var host = getHost(url);
+    if (!(host === "drive.google.com" || host === "docs.google.com" || host === "drive.usercontent.google.com"))
+        return "";
+    var m = String(url).match(/\/file\/d\/([\w-]{10,})/) || String(url).match(/[?&]id=([\w-]{10,})/);
+    return m ? m[1] : "";
+}
+/**
+ * DRIVE: no usa proxy. Se devuelve la URL directa de descarga de Google y es el
+ * REPRODUCTOR (Nuvio) quien la pide a Google, asi que no gasta ancho de banda de
+ * Render. Aqui solo se hace una peticion de 1 byte (Range) para comprobar que el
+ * archivo existe; si la comprobacion falla por otra razon (Render es una IP de
+ * datacenter y Google a veces la trata distinto al celular) NO se descarta el enlace.
+ */
+function extractDrive(embedUrl) {
+    var id = driveId(embedUrl);
+    if (!id)
+        return Promise.reject(Error("DRIVE: no se encontro el ID del archivo en " + embedUrl));
+    // confirm=t salta el aviso de "no se puede analizar si hay virus" de los archivos grandes
+    var direct = "https://drive.usercontent.google.com/download?id=" + id + "&export=download&confirm=t";
+    var note = "";
+    var format = "MP4";
+    return fetch(direct, { method: "GET", headers: { "User-Agent": UA, "Range": "bytes=0-0" } })
+        .then(function (r) {
+        var ct = "";
+        var cd = "";
+        try {
+            ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
+            cd = (r.headers && r.headers.get && r.headers.get("content-disposition")) || "";
+        }
+        catch (_) { }
+        try {
+            if (r.body && r.body.cancel)
+                r.body.cancel();
+        }
+        catch (_) { }
+        if (r.status === 404)
+            throw Error("DRIVE: el archivo no existe (404)");
+        var ext = cd.match(/filename\*?=(?:UTF-8'')?"?[^";]*\.(mp4|mkv|webm|avi|mov)/i);
+        if (ext)
+            format = ext[1].toUpperCase();
+        if (/text\/html/i.test(ct))
+            note = "\u26A0 Drive respondio una pagina (cuota/privado?)";
+        console.log("[DRIVE] " + id + " -> " + r.status + " " + ct.split(";")[0] + " " + format);
+        return { url: direct, headers: {}, format: format, note: note };
+    }, function (e) {
+        // Sin red hacia Google desde aqui: se entrega igual, lo abrira el reproductor
+        console.warn("[DRIVE] No se pudo comprobar (" + e.message + "); se devuelve el enlace igualmente");
+        return { url: direct, headers: {}, format: format, note: note };
+    });
+}
 /**
  * FC (https://<algo>.blogspot.com/?player=fluidplayer&provider=rand&format=video%2Fmp4&link=<url>)
  * No hace falta abrir nada: la URL directa del video ya viene codificada en el
@@ -722,6 +798,8 @@ function extractFC(embedUrl) {
             }
             if (!/^https?:\/\//i.test(link))
                 throw Error("FC: link no es una URL http(s)");
+            if (driveId(link))
+                return [2 /*return*/, extractDrive(link)];
             formatMatch = embedUrl.match(/[?&]format=([^&#]+)/);
             format = "";
             try {
@@ -739,11 +817,167 @@ function extractFC(embedUrl) {
         });
     });
 }
+// OK.RU (https://ok.ru/videoembed/<id>): el atributo data-options trae un JSON con "metadata" (otro JSON en texto)
+// con hlsManifestUrl y videos[]. Portado de pelisgo.js (funciona): mismo parseo, mismo UA movil y mismas cabeceras de reproduccion.
+var OK_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"; // mismo UA que usa pelisgo.js
+var OK_RES = { mobile: "144p", lowest: "240p", low: "360p", sd: "480p", hd: "720p", full: "1080p", quad: "1440p (2K)", ultra: "2160p (4K)" }; // nombre que da ok.ru -> resolucion
+var OK_QUALITY = ["mobile", "lowest", "low", "sd", "hd", "full", "quad", "ultra"];
+function okDecode(s) {
+    return String(s || "").replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+function parseOkru(html) {
+    var m = /data-options=(["'])([\s\S]*?)\1/.exec(html);
+    var meta = null;
+    if (m) {
+        try {
+            var opts = JSON.parse(okDecode(m[2]));
+            var raw = opts && opts.flashvars && opts.flashvars.metadata;
+            meta = typeof raw === "string" ? JSON.parse(raw) : raw;
+        }
+        catch (e) { /* se prueba con regex */ }
+    }
+    var out = [];
+    if (meta) {
+        var hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls;
+        if (hls)
+            out.push({ url: hls, type: "hls", format: "HLS", quality: "Auto (HLS)" });
+        var vids = (meta.videos || []).filter(function (v) { return v && v.url; });
+        vids.sort(function (a, b) { return OK_QUALITY.indexOf(b.name) - OK_QUALITY.indexOf(a.name); });
+        function okMp4(v) { return { url: v.url, format: "MP4", quality: OK_RES[v.name] || String(v.name) }; }
+        if (vids[0])
+            out.push(okMp4(vids[0]));
+        // Si la mejor es mayor a 1080p, se ofrece tambien la de 1080p (menos datos)
+        var full = vids.filter(function (v) { return v.name === "full"; })[0];
+        if (vids[0] && full && vids[0] !== full)
+            out.push(okMp4(full));
+        return out;
+    }
+    var txt = okDecode(html).replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+    var hm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/.exec(txt) || /"ondemandHls"\s*:\s*"([^"]+)"/.exec(txt);
+    if (hm)
+        out.push({ url: hm[1], type: "hls", format: "HLS", quality: "Auto (HLS)" });
+    return out;
+}
+function extractOkru(embedUrl) {
+    if (embedUrl.indexOf("//") === 0)
+        embedUrl = "https:" + embedUrl;
+    return fetch(embedUrl, { headers: { "User-Agent": OK_UA, "Referer": SITE_BASE + "/" } })
+        .then(function (r) {
+        if (!r.ok)
+            throw Error("OK.RU: HTTP " + r.status);
+        return r.text();
+    }).then(function (html) {
+        var streams = parseOkru(html);
+        if (!streams.length)
+            throw Error("OK.RU: no se encontro el video (" + html.length + " bytes, data-options=" + (/data-options=/.test(html) ? "si" : "no") + ")");
+        console.log("[OK.RU] " + streams.map(function (v) { return v.format + " " + v.quality; }).join(", "));
+        return streams.map(function (v) {
+            var o = { url: v.url, headers: { "Referer": "https://ok.ru/", "User-Agent": OK_UA }, format: v.format, quality: v.quality };
+            if (v.type)
+                o.type = v.type; // solo HLS lleva type, igual que en pelisgo.js
+            return o;
+        });
+    });
+}
+/**
+ * Reproductores JW Player del tipo XFileSharing: VIMEO (vimeos.net) y GS (goodstream.one, gscdn.cam).
+ * La pagina del embed trae jwplayer(...).setup({ sources: [{file: "https://.../master.m3u8?t=..."}] }).
+ * En vimeos.net ese script viene empaquetado (eval(function(p,a,c,k,e,d){...})), asi que primero se desempaqueta.
+ * El HLS lleva un token firmado en la URL, por eso se pide en el momento y se devuelve tal cual.
+ */
+function jwPackEnc(c, a) {
+    return (c < a ? "" : jwPackEnc(parseInt(c / a, 10), a)) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+}
+// Dean Edwards packer: eval(function(p,a,c,k,e,d){...}('payload',radix,count,'dic|cio'.split('|')))
+function jwUnpack(src) {
+    var m = /\}\(\s*(['"])((?:\\[\s\S]|(?!\1)[^\\])*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])((?:\\[\s\S]|(?!\5)[^\\])*)\5\s*\.split\(\s*['"]\|['"]\s*\)/.exec(src);
+    if (!m)
+        return null;
+    var p = m[2].replace(/\\(['"\\\/])/g, "$1");
+    var radix = parseInt(m[3], 10), count = parseInt(m[4], 10), dict = m[6].split("|");
+    var map = {};
+    for (var c = count - 1; c >= 0; c--) {
+        var key = jwPackEnc(c, radix);
+        map[key] = dict[c] || key;
+    }
+    return p.replace(/\b\w+\b/g, function (w) { return Object.prototype.hasOwnProperty.call(map, w) ? map[w] : w; });
+}
+function jwTexts(html) {
+    var texts = [html];
+    var re = /eval\(function\(p,a,c,k,e,[a-z]\)[\s\S]*?\.split\(\s*['"]\|['"]\s*\)[^\n]*?\)\)/g, m;
+    while ((m = re.exec(html)) !== null) {
+        try {
+            var u = jwUnpack(m[0]);
+            if (u)
+                texts.unshift(u);
+        }
+        catch (_) { }
+    }
+    return texts;
+}
+// URLs de video del setup de JW Player: file:"..." (m3u8 primero, luego mp4)
+function jwFindFiles(texts) {
+    var out = [];
+    var seen = {};
+    for (var i = 0; i < texts.length; i++) {
+        var t = String(texts[i]).replace(/\\u002F/gi, "/").replace(/\\\//g, "/").replace(/&amp;/g, "&");
+        var re = /["']?file["']?\s*:\s*["'](https?:\/\/[^"'\s]+?\.(?:m3u8|mp4)(?:\?[^"'\s]*)?)["']/gi, m;
+        while ((m = re.exec(t)) !== null) {
+            if (!seen[m[1]]) {
+                seen[m[1]] = true;
+                out.push(m[1]);
+            }
+        }
+        if (!out.length) {
+            var re2 = /https?:\/\/[^"'\s<>\\]+?\.m3u8(?:\?[^"'\s<>\\]*)?/gi;
+            while ((m = re2.exec(t)) !== null) {
+                if (!seen[m[0]]) {
+                    seen[m[0]] = true;
+                    out.push(m[0]);
+                }
+            }
+        }
+    }
+    out.sort(function (a, b) { return (/\.m3u8/.test(a) ? 0 : 1) - (/\.m3u8/.test(b) ? 0 : 1); });
+    return out;
+}
+function extractJw(embedUrl, tag) {
+    return __awaiter(this, void 0, void 0, function () {
+        var origin, resp, html, files, url, isHls;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0:
+                    origin = getOrigin(embedUrl);
+                    if (!origin)
+                        throw Error(tag + ": URL de embed inválida");
+                    return [4 /*yield*/, fetch(embedUrl, { headers: { "User-Agent": UA, "Referer": SITE_BASE + "/", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } })];
+                case 1:
+                    resp = _a.sent();
+                    return [4 /*yield*/, resp.text()];
+                case 2:
+                    html = _a.sent();
+                    files = jwFindFiles(jwTexts(html));
+                    if (!files.length)
+                        throw Error(tag + ": no se encontró el video (HTTP " + resp.status + ", " + html.length + " bytes, packer=" + (/eval\(function\(p,a,c,k,e/.test(html) ? "si" : "no") + ", jwplayer=" + (/jwplayer/i.test(html) ? "si" : "no") + (/cloudflare|cf-chl|just a moment/i.test(html) ? ", CLOUDFLARE" : "") + ")");
+                    url = files[0];
+                    isHls = /\.m3u8/i.test(url);
+                    console.log("[" + tag + "] " + (isHls ? "HLS" : "MP4") + ": " + url);
+                    return [2 /*return*/, __assign({ url: url, headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } }, (isHls ? { type: "hls" } : {}))];
+            }
+        });
+    });
+}
+function extractVimeos(embedUrl) { return extractJw(embedUrl, "VIMEO"); }
+function extractGoodStream(embedUrl) { return extractJw(embedUrl, "GS"); }
 var ALL_SOURCES = {
     Vids: { label: "VST", format: "MP4", extract: extractVids },
     Videro: { label: "VR", format: "HLS", extract: extractVidero },
     Playmate: { label: "PM", format: "HLS", extract: extractPlaymate },
-    FC: { label: "FC", format: "MP4", extract: extractFC }
+    FC: { label: "FC", format: "MP4", extract: extractFC },
+    Okru: { label: "OK.RU", format: "MP4/HLS", extract: extractOkru },
+    Vimeos: { label: "VIMEO", format: "HLS", extract: extractVimeos },
+    GoodStream: { label: "GS", format: "HLS", extract: extractGoodStream },
+    Drive: { label: "DRIVE", format: "MP4", extract: extractDrive }
 };
 // El orden de este objeto define el orden de salida de los streams.
 var SOURCE_EXTRACTORS = {};
@@ -779,6 +1013,19 @@ function getQualityLabel(q) {
  * @param {string|number} [episode]
  * @returns {Promise<Array>}
  */
+// Texto que ve el usuario en cada enlace: servidor y formato, calidad REAL si el extractor la conoce (OK.RU),
+// idioma, y de donde sale (pagina de la entrada y embed del servidor).
+function __buildLabel(source, server, rv, pageUrl) {
+    var label = "\uD83D\uDCFA " + source.label + " (" + (rv.format || source.format) + ")\n" +
+        (rv.quality || getQualityLabel(server.quality)) + " | WEB-DL\n" + getLangLabel(server.lang);
+    if (rv.note)
+        label += "\n" + rv.note;
+    if (pageUrl)
+        label += "\n\uD83D\uDD17 " + pageUrl;
+    if (server.url)
+        label += "\n\u25B6 " + (server.url.length > 110 ? server.url.slice(0, 110) + "\u2026" : server.url);
+    return label;
+}
 // Modo directo del addon (catalogo FuegoCine): "entry:<idPost>" lee esa entrada del feed y resuelve sus servidores, sin pasar por TMDB.
 function __directEntry(postId) {
     return fetch(SITE_BASE + "/feeds/posts/default/" + postId + "?alt=json", { headers: { "User-Agent": UA, "Accept": "application/json" } })
@@ -798,7 +1045,7 @@ function __directEntry(postId) {
             var source = SOURCE_EXTRACTORS[server.sourceKey];
             return Promise.resolve(source.extract(server.url, ctx)).then(function (resolved) {
                 return (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
-                    var label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang)).concat(rv.note ? "\n" + rv.note : "");
+                    var label = __buildLabel(source, server, rv, info.url);
                     return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
                 });
             }).catch(function () { return null; });
@@ -871,7 +1118,7 @@ var __getStreamsTmdb = function (tmdbId, type, season, episode) {
                                     case 2:
                                         resolved = _a.sent();
                                         return [2 /*return*/, (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
-                                                var label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang)).concat(rv.note ? "\n" + rv.note : "");
+                                                var label = __buildLabel(source, server, rv, entry.url);
                                                 return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
                                             })];
                                     case 3:
