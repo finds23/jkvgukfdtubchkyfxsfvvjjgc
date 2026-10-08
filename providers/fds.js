@@ -779,7 +779,40 @@ function getQualityLabel(q) {
  * @param {string|number} [episode]
  * @returns {Promise<Array>}
  */
+// Modo directo del addon (catalogo FuegoCine): "entry:<idPost>" lee esa entrada del feed y resuelve sus servidores, sin pasar por TMDB.
+function __directEntry(postId) {
+    return fetch(SITE_BASE + "/feeds/posts/default/" + postId + "?alt=json", { headers: { "User-Agent": UA, "Accept": "application/json" } })
+        .then(function (r) { if (!r.ok) throw Error("HTTP error! Status: " + r.status); return r.json(); })
+        .then(function (d) {
+        var e = d && d.entry;
+        if (!e) return [];
+        var info = entryInfo(e);
+        var servers = parseServerLinks(info.content)
+            .map(function (s) { return __assign(__assign({}, s), { sourceKey: detectSource(s.url) }); })
+            .filter(function (s) { return s.sourceKey && SOURCE_EXTRACTORS[s.sourceKey]; });
+        if (servers.length === 0) return [];
+        var order = Object.keys(SOURCE_EXTRACTORS);
+        servers.sort(function (a, b) { return order.indexOf(a.sourceKey) - order.indexOf(b.sourceKey); });
+        var ctx = { titles: [stripYear(info.title)], year: extractYear(info.title), original: undefined };
+        return Promise.all(servers.map(function (server) {
+            var source = SOURCE_EXTRACTORS[server.sourceKey];
+            return Promise.resolve(source.extract(server.url, ctx)).then(function (resolved) {
+                return (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
+                    var label = "\uD83D\uDCFA ".concat(source.label, " (").concat(source.format, ")\n").concat(getQualityLabel(server.quality), " | WEB-DL\n").concat(getLangLabel(server.lang)).concat(rv.note ? "\n" + rv.note : "");
+                    return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
+                });
+            }).catch(function () { return null; });
+        })).then(function (results) {
+            return results.filter(Boolean).reduce(function (acc, item) { return acc.concat(item); }, []);
+        });
+    }).catch(function () { return []; });
+}
 exports.getStreams = function (tmdbId, type, season, episode) {
+    var __pd = /^entry:(\d+)$/.exec(String(tmdbId));
+    if (__pd) return __directEntry(__pd[1]);
+    return __getStreamsTmdb(tmdbId, type, season, episode);
+};
+var __getStreamsTmdb = function (tmdbId, type, season, episode) {
     return __awaiter(this, void 0, void 0, function () {
         var info, entry, seasonNum, episodeNum, servers, order_1, results, final, e_4;
         var _this = this;
