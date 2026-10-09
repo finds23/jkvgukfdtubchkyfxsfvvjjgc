@@ -87,19 +87,31 @@ var CACHE_TTL_MS = 10 * 60 * 1000;
 var _cache = {};
 function cacheGet(key) { var c = _cache[key]; return c && (Date.now() - c.t < CACHE_TTL_MS) ? c.v : undefined; }
 function cacheSet(key, v) { _cache[key] = { t: Date.now(), v: v }; return v; }
+
+// Depuracion: en la TV no se ve la consola. Con DEBUG_STREAMS = true, si no hay ningun enlace, la lista muestra UN enlace falso
+// ("DEBUG: ...") con el motivo (TMDB sin respuesta, sin entrada en el feed, servidores que fallaron...). Ponlo en false al terminar.
+var DEBUG_STREAMS = true;
+var _dbgReasons = [];
+var _tmdbWhy = "";
+function dbg(msg) { try { _dbgReasons.push(String(msg).replace(/\s+/g, " ").slice(0, 90)); } catch (_) { } }
+function dbgOut(arr) {
+    if (arr && arr.length) return arr;
+    if (!DEBUG_STREAMS) return arr || [];
+    return [{ name: PROVIDER_NAME, title: "", url: "https://debug.invalid/sin-enlaces", quality: "DEBUG 0 enlaces: " + (_dbgReasons.join(" | ") || "sin motivo registrado").slice(0, 360) }];
+}
 // Switch de sources: true/false para activar o desactivar cada uno sin tocar
 // el resto del código.
 var ENABLED_SOURCES = {
     Vids: false, // "VST"  -> vids.st (DESACTIVADO: desde Nuvio no conecta con vids.st aunque el navegador si; poner true para probar de nuevo)
     Videro: true, // "VR"   -> videro.my  (HLS vía API pública)
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
-    Avc: false, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
+    Avc: true, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
-    Ua: false, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
-    Okru: false, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
+    Ua: true, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
+    Okru: true, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
-    GoodStream: false, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
+    GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
     // US (upns.online) no está soportado todavia.
     // UA (unlimplay.com) ahora soportado con el flujo de Kino (API vimeos.unlimplay.com + validacion de la lista).
     // LV (loadvid.com) descartado: devuelve el m3u8 como texto tras un token CSRF.
@@ -154,29 +166,18 @@ function _getTMDBTitles(tmdbId, type) {
             switch (_e.label) {
                 case 0:
                     path = type === "movie" ? "movie" : "tv";
-                    fetchLang = function (lang) { return __awaiter(_this, void 0, void 0, function () {
-                        var url, resp, data, _1;
-                        return __generator(this, function (_a) {
-                            switch (_a.label) {
-                                case 0:
-                                    _a.trys.push([0, 3, , 4]);
-                                    url = "https://api.themoviedb.org/3/".concat(path, "/").concat(tmdbId, "?api_key=").concat(TMDB_API_KEY, "&language=").concat(lang);
-                                    return [4 /*yield*/, fetchT(url, { headers: { "User-Agent": UA } })];
-                                case 1:
-                                    resp = _a.sent();
-                                    if (!resp.ok)
-                                        return [2 /*return*/, null];
-                                    return [4 /*yield*/, resp.json()];
-                                case 2:
-                                    data = _a.sent();
-                                    return [2 /*return*/, data && data.success === false ? null : data];
-                                case 3:
-                                    _1 = _a.sent();
-                                    return [2 /*return*/, null];
-                                case 4: return [2 /*return*/];
-                            }
-                        });
-                    }); };
+                    fetchLang = function (lang) {
+                        // Se prueba api.themoviedb.org y, si falla (DNS/red de la TV), el alias api.tmdb.org
+                        function one(host) {
+                            return fetchT("https://" + host + "/3/" + path + "/" + tmdbId + "?api_key=" + TMDB_API_KEY + "&language=" + lang, { headers: { "User-Agent": UA } })
+                                .then(function (resp) {
+                                if (!resp.ok) { _tmdbWhy = host + " HTTP " + resp.status; return null; }
+                                return resp.json();
+                            }).then(function (d) { return d && d.success === false ? null : d; })
+                                .then(null, function (e) { _tmdbWhy = host + " " + String((e && e.message) || e).slice(0, 50); return null; });
+                        }
+                        return one("api.themoviedb.org").then(function (d) { return d || one("api.tmdb.org"); });
+                    };
                     return [4 /*yield*/, Promise.all([fetchLang("es-MX"), fetchLang("en-US")])];
                 case 1:
                     _a = _e.sent(), es = _a[0], en = _a[1];
@@ -1353,7 +1354,7 @@ function gatherStreams(servers, ctx, pageUrl) {
                     var label = __buildLabel(source, server, rv, pageUrl);
                     return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
                 });
-            }, function () { results[i] = null; }).then(function () {
+            }, function (e) { results[i] = null; dbg(source.label + ": " + ((e && e.message) || e)); }).then(function () {
                 done++;
                 if (done >= total) return finish();
                 if (results[i] && results[i].length && !grace) grace = setTimeout(finish, EARLY_GRACE_MS);
@@ -1382,27 +1383,31 @@ function __directEntry(postId) {
     }).catch(function () { return []; });
 }
 exports.getStreams = function (tmdbId, type, season, episode) {
+    _dbgReasons = [];
+    _tmdbWhy = "";
     var __pd = /^entry:(\d+)$/.exec(String(tmdbId));
-    if (__pd) return __directEntry(__pd[1]);
-    return __getStreamsTmdb(tmdbId, type, season, episode);
+    var run = __pd ? __directEntry(__pd[1]) : __getStreamsTmdb(tmdbId, type, season, episode);
+    return run.then(dbgOut, function (e) { dbg("error: " + (e && e.message)); return dbgOut([]); });
 };
 function __getStreamsTmdb(tmdbId, type, season, episode) {
     if (!tmdbId || !type) return Promise.resolve([]);
     console.log("[" + PROVIDER_NAME + "] Buscando: TMDB " + tmdbId + " (" + type + ") S" + (season != null ? season : "-") + "E" + (episode != null ? episode : "-"));
     return getTMDBTitles(tmdbId, type).then(function (info) {
-        if (!info || !info.titles.length) return [];
+        if (!info || !info.titles.length) { dbg("TMDB " + tmdbId + " (" + type + ") sin datos: " + (_tmdbWhy || "no existe")); return []; }
+        dbg("TMDB ok: " + info.titles[0] + (info.year ? " (" + info.year + ")" : ""));
         var finder = type === "movie"
             ? findMovieEntry(tmdbId, info.titles, info.year)
             : findEpisodeEntry(tmdbId, info.titles, season ? Number(season) : 1, episode !== undefined && episode !== null ? Number(episode) : 1);
         return finder.then(function (entry) {
-            if (!entry) { console.log("[" + PROVIDER_NAME + "] Sin entrada para \"" + info.titles[0] + "\""); return []; }
+            if (!entry) { console.log("[" + PROVIDER_NAME + "] Sin entrada para \"" + info.titles[0] + "\""); dbg("el sitio no tiene entrada para \"" + info.titles[0] + "\""); return []; }
             console.log("[" + PROVIDER_NAME + "] Entrada elegida: \"" + entry.title + "\"");
             var servers = __serversOf(entry);
-            if (!servers.length) { console.warn("[" + PROVIDER_NAME + "] La entrada no tiene servidores soportados"); return []; }
+            if (!servers.length) { console.warn("[" + PROVIDER_NAME + "] La entrada no tiene servidores soportados"); dbg("entrada sin servidores soportados"); return []; }
             return gatherStreams(servers, { titles: info.titles, year: info.year, original: info.original }, entry.url);
         });
     }).catch(function (e) {
         console.error("[" + PROVIDER_NAME + "] Error: " + e.message);
+        dbg("error: " + e.message);
         return [];
     });
 }
