@@ -942,9 +942,19 @@ function jwFindFiles(texts) {
     return out;
 }
 /**
- * Comprueba el HLS como lo pediria el reproductor (lista -> variante -> primer fragmento) y prueba varias combinaciones de cabeceras.
- * Devuelve las primeras que funcionan y una nota corta para la etiqueta del stream (asi se ve en Nuvio que respondio el servidor).
+ * Comprueba el HLS como lo pediria el reproductor (lista -> variante -> primer fragmento) y prueba varias combinaciones de
+ * cabeceras y de User-Agent (escritorio y movil). Devuelve las primeras que funcionan y una nota corta para la etiqueta del
+ * stream: asi se ve en Nuvio que respondio el servidor sin necesitar logs. Si un 403 viene de Cloudflare u otro filtro, la nota lo dice.
  */
+var JW_BASE = { "Accept": "*/*", "Accept-Language": "es-419,es;q=0.9" };
+function jwHeaders(extra) {
+    var h = {};
+    for (var k in JW_BASE)
+        h[k] = JW_BASE[k];
+    for (var k2 in extra)
+        h[k2] = extra[k2];
+    return h;
+}
 function jwProbe(url, headers, range) {
     var h = {};
     for (var k in headers)
@@ -952,12 +962,22 @@ function jwProbe(url, headers, range) {
     if (range)
         h["Range"] = "bytes=0-1";
     return fetch(url, { headers: h }).then(function (r) {
-        var out = { status: r.status, text: "" };
-        if (!range)
-            return r.text().then(function (t) { out.text = String(t || "").slice(0, 8000); return out; });
+        var out = { status: r.status, text: "", server: "", cf: "" };
+        try {
+            out.server = String((r.headers && r.headers.get && r.headers.get("server")) || "");
+            out.cf = String((r.headers && r.headers.get && r.headers.get("cf-mitigated")) || "");
+        }
+        catch (_) { }
+        if (!range || (r.status !== 200 && r.status !== 206))
+            return r.text().then(function (t) { out.text = String(t || "").slice(0, 8000); return out; }, function () { return out; });
         try { if (r.body && r.body.cancel) r.body.cancel(); } catch (_) { }
         return out;
-    }).catch(function (e) { return { status: "red", text: "", error: e && e.message }; });
+    }).catch(function (e) { return { status: "red", text: "", server: "", cf: "", error: e && e.message }; });
+}
+function jwWhy(a) {
+    var t = String(a.text || "").replace(/\s+/g, " ").trim();
+    var who = /cloudflare/i.test(a.server) || a.cf || /cloudflare|just a moment|cf-chl/i.test(t) ? "cloudflare" : (a.server || "");
+    return (who ? who + (a.cf ? "/" + a.cf : "") : "") + (t && !/^</.test(t) ? " \"" + t.slice(0, 28) + "\"" : (/just a moment/i.test(t) ? " reto" : ""));
 }
 function jwFirstUrl(text, base) {
     var lines = String(text || "").split("\n").map(function (x) { return x.trim(); }).filter(function (x) { return x && x.charAt(0) !== "#"; });
@@ -971,79 +991,96 @@ function jwFirstUrl(text, base) {
         return o + l;
     return base.replace(/[?#].*$/, "").replace(/[^\/]*$/, "") + l;
 }
+function jwSegOk(seg, headers) {
+    return jwProbe(seg, headers, true).then(function (c) {
+        return (c.status === 200 || c.status === 206) ? { ok: true, detail: "fragmento " + c.status } : { ok: false, detail: "fragmento " + c.status, why: jwWhy(c) };
+    });
+}
 function jwCheckHls(url, headers) {
     return jwProbe(url, headers, false).then(function (a) {
         if (a.status !== 200 || !/#EXTM3U/.test(a.text))
-            return { ok: false, detail: "lista " + a.status };
+            return { ok: false, detail: "lista " + a.status, why: jwWhy(a) };
         var next = jwFirstUrl(a.text, url);
         if (next && /\.m3u8/i.test(next))
             return jwProbe(next, headers, false).then(function (b) {
                 if (b.status !== 200)
-                    return { ok: false, detail: "variante " + b.status };
+                    return { ok: false, detail: "variante " + b.status, why: jwWhy(b) };
                 var seg = jwFirstUrl(b.text, next);
-                if (!seg)
-                    return { ok: true, detail: "lista 200" };
-                return jwProbe(seg, headers, true).then(function (c) {
-                    return (c.status === 200 || c.status === 206) ? { ok: true, detail: "fragmento " + c.status } : { ok: false, detail: "fragmento " + c.status };
-                });
+                return seg ? jwSegOk(seg, headers) : { ok: true, detail: "lista 200" };
             });
-        if (next)
-            return jwProbe(next, headers, true).then(function (c) {
-                return (c.status === 200 || c.status === 206) ? { ok: true, detail: "fragmento " + c.status } : { ok: false, detail: "fragmento " + c.status };
-            });
-        return { ok: true, detail: "lista 200" };
+        return next ? jwSegOk(next, headers) : { ok: true, detail: "lista 200" };
     });
 }
-function jwPickHeaders(url, embedUrl, origin) {
+// Cookies que pone la pagina del embed (si el cliente deja leerlas); algunos CDN las piden
+function jwCookies(resp) {
+    try {
+        var list = (resp.headers.getSetCookie && resp.headers.getSetCookie()) || [];
+        if (!list.length) {
+            var one = resp.headers.get && resp.headers.get("set-cookie");
+            if (one)
+                list = String(one).split(/,(?=\s*[\w.-]+=)/);
+        }
+        return list.map(function (c) { return String(c).split(";")[0].trim(); }).filter(Boolean).join("; ");
+    }
+    catch (_) {
+        return "";
+    }
+}
+function jwPickHeaders(url, embedUrl, origin, ua, cookie, label) {
     var variants = [
-        { name: "A", headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } },
-        { name: "B", headers: { "Referer": embedUrl, "User-Agent": UA } },
-        { name: "C", headers: { "Referer": origin + "/", "User-Agent": UA } },
-        { name: "D", headers: { "User-Agent": UA } }
+        { name: "A", headers: jwHeaders({ "Referer": origin + "/", "Origin": origin, "User-Agent": ua }) },
+        { name: "B", headers: jwHeaders({ "Referer": embedUrl, "User-Agent": ua }) },
+        { name: "D", headers: jwHeaders({ "User-Agent": ua }) }
     ];
+    if (cookie)
+        variants.push({ name: "E", headers: jwHeaders({ "Referer": origin + "/", "Origin": origin, "User-Agent": ua, "Cookie": cookie }) });
     var tried = [];
     function next(i) {
         if (i >= variants.length)
-            return Promise.resolve({ headers: variants[0].headers, note: "\u26A0 sin verificar (" + tried.join(", ") + ")" });
+            return Promise.resolve({ headers: variants[0].headers, verified: false, note: "\u26A0 sin verificar (" + tried.join(", ") + ")" });
         var v = variants[i];
         return jwCheckHls(url, v.headers).then(function (r) {
-            console.log("[JW] cabeceras " + v.name + ": " + r.detail);
+            console.log("[JW] " + label + v.name + ": " + r.detail + (r.why ? " <" + r.why + ">" : ""));
             if (r.ok)
-                return { headers: v.headers, note: "\u2713 verificado (" + v.name + ": " + r.detail + ")" };
-            tried.push(v.name + ":" + r.detail);
+                return { headers: v.headers, verified: true, note: "\u2713 verificado (" + label + v.name + ": " + r.detail + ")" };
+            tried.push(label + v.name + ":" + r.detail.replace(/^(\w+) /, "$1 ") + (i === 0 && r.why ? " <" + r.why + ">" : ""));
             return next(i + 1);
         });
     }
     return next(0);
 }
 function extractJw(embedUrl, tag) {
-    return __awaiter(this, void 0, void 0, function () {
-        var origin, resp, html, files, url, isHls;
-        return __generator(this, function (_a) {
-            switch (_a.label) {
-                case 0:
-                    origin = getOrigin(embedUrl);
-                    if (!origin)
-                        throw Error(tag + ": URL de embed inválida");
-                    return [4 /*yield*/, fetch(embedUrl, { headers: { "User-Agent": UA, "Referer": SITE_BASE + "/", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } })];
-                case 1:
-                    resp = _a.sent();
-                    return [4 /*yield*/, resp.text()];
-                case 2:
-                    html = _a.sent();
-                    files = jwFindFiles(jwTexts(html));
-                    if (!files.length)
-                        throw Error(tag + ": no se encontró el video (HTTP " + resp.status + ", " + html.length + " bytes, packer=" + (/eval\(function\(p,a,c,k,e/.test(html) ? "si" : "no") + ", jwplayer=" + (/jwplayer/i.test(html) ? "si" : "no") + (/cloudflare|cf-chl|just a moment/i.test(html) ? ", CLOUDFLARE" : "") + ")");
-                    url = files[0];
-                    isHls = /\.m3u8/i.test(url);
-                    console.log("[" + tag + "] " + (isHls ? "HLS" : "MP4") + ": " + url);
-                    if (!isHls)
-                        return [2 /*return*/, { url: url, headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } }];
-                    return [2 /*return*/, jwPickHeaders(url, embedUrl, origin).then(function (pick) {
-                            return { url: url, headers: pick.headers, type: "hls", note: pick.note };
-                        })];
-            }
+    var origin = getOrigin(embedUrl);
+    if (!origin)
+        return Promise.reject(Error(tag + ": URL de embed inválida"));
+    var uas = [{ ua: UA, label: "" }, { ua: OK_UA, label: "m" }];
+    function attempt(i) {
+        var ua = uas[i].ua;
+        return fetch(embedUrl, { headers: { "User-Agent": ua, "Referer": SITE_BASE + "/", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } }).then(function (resp) {
+            return resp.text().then(function (html) {
+                var files = jwFindFiles(jwTexts(html));
+                if (!files.length)
+                    throw Error(tag + ": no se encontró el video (HTTP " + resp.status + ", " + html.length + " bytes, packer=" + (/eval\(function\(p,a,c,k,e/.test(html) ? "si" : "no") + ", jwplayer=" + (/jwplayer/i.test(html) ? "si" : "no") + (/cloudflare|cf-chl|just a moment/i.test(html) ? ", CLOUDFLARE" : "") + ")");
+                var url = files[0];
+                if (!/\.m3u8/i.test(url))
+                    return { url: url, headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": ua } };
+                console.log("[" + tag + "] HLS: " + url);
+                return jwPickHeaders(url, embedUrl, origin, ua, jwCookies(resp), uas[i].label).then(function (pick) {
+                    return { url: url, headers: pick.headers, type: "hls", note: pick.note, verified: pick.verified };
+                });
+            });
         });
+    }
+    return attempt(0).then(function (r) {
+        if (r.verified !== false || !r.type)
+            return r;
+        // Con el User-Agent de escritorio no hubo suerte: se repite como navegador movil (el mismo que usa OK.RU)
+        return attempt(1).then(function (r2) {
+            if (r2.verified)
+                return r2;
+            r.note = r.note.replace(/\)$/, " | " + r2.note.replace(/^\u26A0 sin verificar \(/, "").replace(/\)$/, "") + ")");
+            return r;
+        }, function () { return r; });
     });
 }
 function extractVimeos(embedUrl) { return extractJw(embedUrl, "VIMEO"); }
