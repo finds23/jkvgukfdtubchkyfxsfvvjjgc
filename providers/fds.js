@@ -112,7 +112,7 @@ var ENABLED_SOURCES = {
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
     Avc: true, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
-    Ua: true, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
+    Ua: false, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
     Okru: true, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
