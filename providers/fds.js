@@ -10,7 +10,7 @@
 // Flujo:
 //   TMDB -> títulos/año -> búsqueda en el feed JSON de Blogger -> entrada correcta
 //   -> parsear _SV_LINKS -> decodificar el embed -> extractor por host
-//   (VST, VR, PM y FC).
+//   (VR, PM, FC, OK.RU, VIMEO, GS y DRIVE).
 //
 // Contrato Nuvio: exports.getStreams(tmdbId, type, season, episode) -> Promise<Array<Stream>>
 // Stream: { name, title, url, quality, headers?, type? }
@@ -107,18 +107,15 @@ function dbgOut(arr) {
 // Switch de sources: true/false para activar o desactivar cada uno sin tocar
 // el resto del código.
 var ENABLED_SOURCES = {
-    Vids: false, // "VST"  -> vids.st (DESACTIVADO: desde Nuvio no conecta con vids.st aunque el navegador si; poner true para probar de nuevo)
     Videro: true, // "VR"   -> videro.my  (HLS vía API pública)
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
-    Avc: true, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
-    Ua: false, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
     Okru: true, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
     GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
     // US (upns.online) no está soportado todavia.
-    // UA (unlimplay.com) ahora soportado con el flujo de Kino (API vimeos.unlimplay.com + validacion de la lista).
+    // UA (unlimplay.com), AVC (avcaption.com) y VST (vids.st) se quitaron del plugin.
     // LV (loadvid.com) descartado: devuelve el m3u8 como texto tras un token CSRF.
 };
 // ─────────────────────────────────────────────
@@ -462,16 +459,10 @@ function parseServerLinks(content) {
 }
 function detectSource(url) {
     var host = getHost(url);
-    if (host === "vids.st" || host.endsWith(".vids.st"))
-        return "Vids";
     if (host === "videro.my" || host.endsWith(".videro.my"))
         return "Videro";
     if (host === "playmate.to" || host.endsWith(".playmate.to"))
         return "Playmate";
-    if (host === "avcaption.com" || host.endsWith(".avcaption.com"))
-        return "Avc";
-    if ((host === "unlimplay.com" || host.endsWith(".unlimplay.com")) && /\/f\/embed\//.test(url))
-        return "Ua";
     // Google Drive (drive.google.com / docs.google.com / drive.usercontent.google.com)
     if (driveId(url))
         return "Drive";
@@ -489,174 +480,6 @@ function detectSource(url) {
 // ─────────────────────────────────────────────
 // Extractores
 // ─────────────────────────────────────────────
-/**
- * VST (https://vids.st/e/<id>)
- * 1) Se buscan en el HTML del embed todas las URLs de video (.mp4 / .m3u8), de cualquier host.
- * 2) Si no hay ninguna, se prueba la URL construida con el ID: /storage/uploads/video<id>/remote.mp4
- * 3) Cada candidata se COMPRUEBA antes de devolverla; si da 404 se descarta (asi no sale un enlace muerto en Nuvio).
- */
-function vidsCollectCandidates(html, embedUrl) {
-    var text = String(html || "")
-        .replace(/\\u002F/gi, "/")
-        .replace(/\\\//g, "/")
-        .replace(/&amp;/g, "&");
-    var re = /https?:\/\/[^"'\s<>\\()]+?\.(?:mp4|m3u8)(?:\?[^"'\s<>\\()]*)?/gi;
-    var seen = {};
-    var list = [];
-    var m;
-    while ((m = re.exec(text)) !== null) {
-        var u = m[0];
-        if (seen[u])
-            continue;
-        seen[u] = true;
-        list.push(u);
-    }
-    var host = getHost(embedUrl);
-    // Primero las del mismo host del embed (o de un subdominio), despues el resto
-    list.sort(function (a, b) {
-        var sa = getHost(a).indexOf(host.replace(/^www\./, "")) !== -1 ? 0 : 1;
-        var sb = getHost(b).indexOf(host.replace(/^www\./, "")) !== -1 ? 0 : 1;
-        return sa - sb;
-    });
-    return list;
-}
-function vidsAttempt(url, headers, method, range) {
-    var h = {};
-    for (var k in headers)
-        h[k] = headers[k];
-    if (range)
-        h["Range"] = "bytes=0-1";
-    return fetchT(url, { method: method, headers: h }).then(function (r) {
-        var ct = "";
-        try {
-            ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
-        }
-        catch (_) { }
-        return { status: r.status, ok: r.ok || r.status === 206, ct: ct, type: r.type || "", redirected: !!r.redirected, finalUrl: r.url || "" };
-    }).catch(function (e) {
-        return { status: "red", ok: false, ct: "", type: "", redirected: false, finalUrl: "" };
-    });
-}
-function vidsTag(r) {
-    return r.status + (r.status === 0 && r.type ? "(" + r.type + ")" : "");
-}
-function vidsIsPlayable(url, headers) {
-    // Estados: "ok" (2xx/206 con tipo de video), "dead" (404/410: no existe) o "unknown" (403, 416, status 0, error de red...)
-    return vidsAttempt(url, headers, "HEAD", false).then(function (a) {
-        if (a.ok || a.status === 404 || a.status === 410)
-            return { a: a };
-        return vidsAttempt(url, headers, "GET", true).then(function (b) {
-            if (b.ok || b.status === 404 || b.status === 410)
-                return { a: a, b: b };
-            // Tambien se prueba sin ninguna cabecera, por si alguna de las nuestras molesta
-            return vidsAttempt(url, {}, "HEAD", false).then(function (p) { return { a: a, b: b, p: p }; });
-        });
-    }).then(function (x) {
-        var all = [x.a, x.b, x.p].filter(Boolean);
-        var best = all[all.length - 1];
-        var good = all.filter(function (r) { return r.ok && !/text\/html/i.test(r.ct); })[0];
-        var dead = all.filter(function (r) { return r.status === 404 || r.status === 410; })[0];
-        var redirect = all.filter(function (r) { return r.redirected && r.finalUrl && r.finalUrl !== url; })[0];
-        console.log("[VST] Comprobando " + url + " -> HEAD " + vidsTag(x.a) + (x.b ? " / GET " + vidsTag(x.b) : "") + (x.p ? " / plano " + vidsTag(x.p) : "") + (redirect ? " | redirige a " + redirect.finalUrl : ""));
-        var detail = "H" + vidsTag(x.a) + (x.b ? " G" + vidsTag(x.b) : "") + (x.p ? " P" + vidsTag(x.p) : "") + (good && good.ct ? " " + good.ct.split(";")[0] : "");
-        var state = good ? "ok" : (dead ? "dead" : "unknown");
-        return { state: state, status: detail, finalUrl: redirect ? redirect.finalUrl : "" };
-    });
-}
-function vidsSlug(s) {
-    var out = String(s || "");
-    try {
-        out = out.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    }
-    catch (_) { }
-    return out.toLowerCase().replace(/['\u2019`]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
-function extractVids(embedUrl, ctx) {
-    var origin = getOrigin(embedUrl);
-    var idMatch = embedUrl.match(/\/e\/([^\/?#]+)/);
-    var id = idMatch ? idMatch[1] : null;
-    var headers = { "Referer": origin + "/", "User-Agent": UA };
-    var embedNote = "embed ?";
-    return fetchT(embedUrl, { headers: headers })
-        .then(function (resp) {
-        embedNote = "embed " + resp.status;
-        return resp.ok ? resp.text() : "";
-    })
-        .catch(function (e) {
-        embedNote = "embed sin acceso";
-        console.warn("[VST] No se pudo leer el embed: " + e.message);
-        return "";
-    })
-        .then(function (html) {
-        // 1) URLs de video que aparezcan en el HTML
-        var candidates = vidsCollectCandidates(html, embedUrl);
-        // 2) vids.st guarda el archivo como /storage/uploads/video<ID>/<titulo-en-slug>-<año>.mp4
-        if (id) {
-            var base = origin + "/storage/uploads/video" + id + "/";
-            var names = [];
-            var seenName = {};
-            var addName = function (t) {
-                var slug = vidsSlug(t);
-                if (slug && !seenName[slug]) {
-                    seenName[slug] = true;
-                    names.push(slug);
-                }
-            };
-            var tm = String(html || "").match(/<title[^>]*>([^<]+)<\/title>/i);
-            if (tm)
-                addName(tm[1].replace(/\.(mp4|mkv)$/i, ""));
-            // vids.st nombra el archivo con el titulo ORIGINAL; ese va primero
-            if (ctx && ctx.original)
-                addName(ctx.original);
-            var titles = (ctx && ctx.titles) || [];
-            for (var i = 0; i < titles.length && i < 5; i++)
-                addName(titles[i]);
-            var year = ctx && ctx.year;
-            names.forEach(function (slug) {
-                if (year)
-                    candidates.push(base + slug + "-" + year + ".mp4");
-                candidates.push(base + slug + ".mp4");
-            });
-            candidates.push(base + "remote.mp4");
-        }
-        var seen = {};
-        candidates = candidates.filter(function (u) { return seen[u] ? false : (seen[u] = true); }).slice(0, 14);
-        console.log("[VST] Candidatas (" + candidates.length + "): " + candidates.slice(0, 8).join(" | "));
-        // Se comprueban todas a la vez y se toma la primera valida segun el orden
-        return Promise.all(candidates.map(function (u) { return vidsIsPlayable(u, headers); })).then(function (states) {
-            var j;
-            for (j = 0; j < candidates.length; j++)
-                if (states[j].state === "ok")
-                    return { url: candidates[j], note: "ok " + states[j].status, finalUrl: states[j].finalUrl };
-            for (j = 0; j < candidates.length; j++)
-                if (states[j].state === "unknown") {
-                    console.warn("[VST] Ninguna candidata confirmada; uso la primera que no dio 404: " + candidates[j]);
-                    return { url: candidates[j], note: "sin confirmar " + states[j].status, finalUrl: states[j].finalUrl };
-                }
-            return null;
-        });
-    })
-        .then(function (found) {
-        if (!found)
-            throw Error("VST: ninguna URL de video respondio (404/403). Embed: " + embedUrl);
-        var url = found.url;
-        console.log("[VST] Video: " + url + " (" + found.note + ")");
-        var isHls = /\.m3u8(\?|$)/i.test(url);
-        var shortUrl = url.replace(/^https?:\/\/[^\/]+/, "").slice(-45);
-        var type = isHls ? "hls" : "mp4";
-        var diag = found.note + " \u00B7 " + embedNote;
-        var MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36";
-        // Varias variantes para descubrir cual acepta el servidor
-        var out = [
-            { url: url, headers: {}, type: type, note: "VST A (sin cabeceras): " + diag + " \u00B7 " + shortUrl },
-            { url: url, headers: { "Referer": embedUrl, "User-Agent": UA }, type: type, note: "VST B (Referer): " + diag },
-            { url: url, headers: { "Referer": origin + "/", "User-Agent": MOBILE_UA, "Accept": "*/*", "Accept-Language": "es-419,es;q=0.9", "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Site": "same-origin" }, type: type, note: "VST C (navegador movil)" }
-        ];
-        if (found.finalUrl)
-            out.push({ url: found.finalUrl, headers: {}, type: type, note: "VST R (URL tras redireccion)" });
-        return out;
-    });
-}
 /**
  * VR (https://videro.my/e/<id>)
  * API pública: GET /api/videos/public/<id> -> { hls_url: "/hls/<hash>/index.m3u8", ... }
@@ -815,96 +638,14 @@ function extractDrive(embedUrl) {
         if (/text\/html/i.test(ct))
             throw Error("DRIVE: Drive respondio una pagina (cuota/privado?)");
         console.log("[DRIVE] " + id + " -> " + r.status + " " + ct.split(";")[0] + " " + format);
-        return { url: direct, headers: {}, format: format, note: note };
+        return { url: direct, headers: { "User-Agent": UA }, format: format, note: note };
     }, function (e) {
         // Sin red hacia Google desde aqui: se entrega igual, lo abrira el reproductor
         console.warn("[DRIVE] No se pudo comprobar (" + e.message + "); se devuelve el enlace igualmente");
-        return { url: direct, headers: {}, format: format, note: note };
+        return { url: direct, headers: { "User-Agent": UA }, format: format, note: note };
     });
 }
 
-/**
- * AVC (https://avcaption.com/watch/<id>) - mismo flujo que el plugin de Kino:
- * GET /api/stream/<id>/token devuelve `master_m3u8` (texto); se toma la variante de mayor BANDWIDTH.
- */
-function extractAvc(embedUrl) {
-    var m = String(embedUrl).match(/\/watch\/([A-Za-z0-9]{16,64})/);
-    if (!m)
-        return Promise.reject(Error("AVC: identificador inválido"));
-    var H = { "User-Agent": UA, "Referer": "https://avcaption.com/", "Accept": "application/json" };
-    return fetchT("https://avcaption.com/api/stream/" + m[1] + "/token", { headers: H })
-        .then(function (r) {
-        if (!r.ok)
-            throw Error("AVC: HTTP " + r.status);
-        return r.json();
-    }).then(function (j) {
-        var lines = String((j && j.master_m3u8) || "").split(/\r?\n/);
-        var best = null;
-        for (var i = 0; i < lines.length; i++) {
-            if (lines[i].indexOf("#EXT-X-STREAM-INF") !== 0)
-                continue;
-            var next = String(lines[i + 1] || "").trim();
-            if (!next || next.charAt(0) === "#")
-                continue;
-            var bw = /BANDWIDTH=(\d+)/.exec(lines[i]);
-            var n = bw ? Number(bw[1]) : 0;
-            if (!best || n > best.bw)
-                best = { bw: n, url: next };
-        }
-        if (!best)
-            throw Error("AVC: no entregó variantes");
-        var url = /^https?:/.test(best.url) ? best.url : "https://avcaption.com" + (best.url.charAt(0) === "/" ? "" : "/") + best.url;
-        return { url: url, headers: { "Referer": "https://avcaption.com/", "User-Agent": UA }, type: "hls" };
-    });
-}
-
-/**
- * UA (https://unlimplay.com/f/embed/<movie|tv>/<id>) - portado del plugin de Kino.
- * Pide a vimeos.unlimplay.com el manifiesto (latino > español > directo) y COMPRUEBA que sea una lista HLS valida;
- * cada intento puede devolver un token distinto, asi que se reintenta unas veces si la lista no es valida.
- */
-function extractUa(embedUrl) {
-    var m = /unlimplay\.com\/f\/embed\/([A-Za-z]+)\/(\d+)/.exec(String(embedUrl));
-    if (!m)
-        return Promise.reject(Error("UA: enlace incompleto"));
-    var type = (m[1] === "tv" || m[1] === "series" || m[1] === "serie") ? "tv" : "movie";
-    var id = m[2];
-    var apiHeaders = { "User-Agent": UA, "Origin": "https://unlimplay.com" };
-    var playHeaders = { "User-Agent": UA, "Referer": "https://videoapi.la/" };
-    var api = "https://vimeos.unlimplay.com/?id=" + encodeURIComponent(id) + "&type=" + encodeURIComponent(type);
-    var MAX_TRIES = 3;
-    var last = "";
-    function attempt(n) {
-        if (n >= MAX_TRIES)
-            return Promise.reject(Error("UA: no entregó una lista reproducible" + (last ? ": " + last : "")));
-        return fetchT(api, { headers: apiHeaders }).then(function (r) {
-            if (!r.ok)
-                throw Error("UA: HTTP " + r.status);
-            return r.json();
-        }).then(function (j) {
-            var url = String((j && j.embeds && j.embeds.latino && j.embeds.latino.direct) ||
-                (j && j.embeds && j.embeds.espanol && j.embeds.espanol.direct) ||
-                (j && j.direct) || "");
-            if (!/^https:\/\//.test(url))
-                throw Error("UA: no entregó manifiesto");
-            return fetchT(url, { headers: playHeaders }).then(function (r2) {
-                if (!r2.ok)
-                    throw new Error("la lista respondió " + r2.status);
-                return r2.text();
-            }).then(function (txt) {
-                if (String(txt).trim().slice(0, 64).indexOf("#EXTM3U") !== 0)
-                    throw new Error("no devolvió una lista de reproducción");
-                return { url: url, headers: playHeaders, type: "hls" };
-            });
-        }).then(null, function (e) {
-            if (/^UA: HTTP|^UA: no entregó manifiesto/.test(String(e && e.message)))
-                throw e; // fallo de la API: reintentar no ayuda
-            last = String((e && e.message) || e).slice(0, 80);
-            return attempt(n + 1);
-        });
-    }
-    return attempt(0);
-}
 /**
  * FC (https://<algo>.blogspot.com/?player=fluidplayer&provider=rand&format=video%2Fmp4&link=<url>)
  * No hace falta abrir nada: la URL directa del video ya viene codificada en el
@@ -1272,13 +1013,10 @@ function runSource(source, url, ctx) {
     });
 }
 var ALL_SOURCES = {
-    Vids: { label: "VST", format: "MP4", extract: extractVids },
     Videro: { label: "VR", format: "HLS", extract: extractVidero },
     Playmate: { label: "PM", format: "HLS", extract: extractPlaymate },
-    Avc: { label: "AVC", format: "HLS", extract: extractAvc },
     FC: { label: "FC", format: "MP4", extract: extractFC },
     Okru: { label: "OK.RU", format: "MP4/HLS", extract: extractOkru },
-    Ua: { label: "UA", format: "HLS", extract: extractUa },
     Vimeos: { label: "VIMEO", format: "HLS", extract: extractVimeos },
     GoodStream: { label: "GS", format: "HLS", extract: extractGoodStream },
     Drive: { label: "DRIVE", format: "MP4", extract: extractDrive }
