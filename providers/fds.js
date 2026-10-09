@@ -69,6 +69,11 @@ var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, l
 // ── Mejoras de velocidad ─────────────────────────────────────────────
 // fetchT = fetch con tiempo limite: antes una peticion colgada (TMDB, feed, embed) bloqueaba TODO hasta el limite del sistema.
 // Usa el `fetch` que Nuvio le entrega al plugin (no se busca en globalThis) y NO lo sobrescribe, para funcionar igual en celular y TV.
+// Temporizadores seguros: en el entorno de Nuvio de la TV `clearTimeout` NO existe ("clearTimeout is not defined") y antes
+// eso hacia fallar todas las peticiones. Si falta setTimeout, simplemente no hay limite de tiempo; si falta clearTimeout, no se cancela
+// (el aviso tardio es inofensivo porque cada uso comprueba si ya termino).
+function _setT(fn, ms) { try { return typeof setTimeout === "function" ? setTimeout(fn, ms) : null; } catch (_) { return null; } }
+function _clrT(id) { try { if (id !== null && id !== undefined && typeof clearTimeout === "function") clearTimeout(id); } catch (_) { } }
 var FETCH_TIMEOUT_MS = 12000;
 function fetchT(url, opts) {
     // OJO: NO se usa AbortController/`signal`. Algunos entornos de Nuvio (p. ej. el de la TV) pasan las opciones de fetch por un
@@ -76,11 +81,11 @@ function fetchT(url, opts) {
     // las opciones que llegan a fetch son exactamente las mismas que enviaba el plugin original.
     var timer;
     var limit = new Promise(function (_, reject) {
-        timer = setTimeout(function () { reject(Error("fetch: tiempo agotado (" + FETCH_TIMEOUT_MS + " ms)")); }, FETCH_TIMEOUT_MS);
+        timer = _setT(function () { reject(Error("fetch: tiempo agotado (" + FETCH_TIMEOUT_MS + " ms)")); }, FETCH_TIMEOUT_MS);
     });
     var req;
-    try { req = opts === undefined ? fetch(url) : fetch(url, opts); } catch (e) { clearTimeout(timer); return Promise.reject(e); }
-    return Promise.race([req, limit]).then(function (r) { clearTimeout(timer); return r; }, function (e) { clearTimeout(timer); throw e; });
+    try { req = opts === undefined ? fetch(url) : fetch(url, opts); } catch (e) { _clrT(timer); return Promise.reject(e); }
+    return Promise.race([req, limit]).then(function (r) { _clrT(timer); return r; }, function (e) { _clrT(timer); throw e; });
 }
 // cache en memoria (10 min): reproducir el mismo titulo otra vez, o cambiar de servidor, ya no repite TMDB ni la busqueda en el feed
 var CACHE_TTL_MS = 10 * 60 * 1000;
@@ -1232,7 +1237,7 @@ function extractJw(embedUrl, tag) {
         return attempt(1).catch(function (e2) { throw Error(e.message + " | " + e2.message); });
     });
     var soft = new Promise(function (resolve, reject) {
-        setTimeout(function () {
+        _setT(function () {
             if (found) {
                 found.note = "\u26A0 sin verificar (tiempo agotado)";
                 found.verified = false;
@@ -1254,14 +1259,14 @@ function runSource(source, url, ctx) {
     var t0 = Date.now();
     var timer;
     var limit = new Promise(function (_, reject) {
-        timer = setTimeout(function () { reject(Error("tiempo agotado (" + SOURCE_TIMEOUT_MS + " ms)")); }, SOURCE_TIMEOUT_MS);
+        timer = _setT(function () { reject(Error("tiempo agotado (" + SOURCE_TIMEOUT_MS + " ms)")); }, SOURCE_TIMEOUT_MS);
     });
     return Promise.race([Promise.resolve().then(function () { return source.extract(url, ctx); }), limit]).then(function (r) {
-        clearTimeout(timer);
+        _clrT(timer);
         console.log("[" + source.label + "] OK en " + (Date.now() - t0) + " ms");
         return r;
     }, function (e) {
-        clearTimeout(timer);
+        _clrT(timer);
         console.warn("[" + source.label + "] fallo en " + (Date.now() - t0) + " ms: " + e.message);
         throw e;
     });
@@ -1338,15 +1343,15 @@ function gatherStreams(servers, ctx, pageUrl) {
         function finish() {
             if (finished) return;
             finished = true;
-            clearTimeout(grace);
-            clearTimeout(hard);
+            _clrT(grace);
+            _clrT(hard);
             var out = [];
             for (var k = 0; k < total; k++) if (results[k]) out = out.concat(results[k]);
             console.log("[" + PROVIDER_NAME + "] \u2713 " + out.length + " streams devueltos (" + done + "/" + total + " servidores respondieron)");
             resolve(out);
         }
         if (!total) return resolve([]);
-        hard = setTimeout(finish, HARD_LIMIT_MS);
+        hard = _setT(finish, HARD_LIMIT_MS);
         servers.forEach(function (server, i) {
             var source = SOURCE_EXTRACTORS[server.sourceKey];
             runSource(source, server.url, ctx).then(function (resolved) {
@@ -1357,7 +1362,7 @@ function gatherStreams(servers, ctx, pageUrl) {
             }, function (e) { results[i] = null; dbg(source.label + ": " + ((e && e.message) || e)); }).then(function () {
                 done++;
                 if (done >= total) return finish();
-                if (results[i] && results[i].length && !grace) grace = setTimeout(finish, EARLY_GRACE_MS);
+                if (results[i] && results[i].length && !grace) grace = _setT(finish, EARLY_GRACE_MS);
             });
         });
     });
