@@ -100,12 +100,13 @@ var ENABLED_SOURCES = {
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
     Avc: true, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
+    Ua: true, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
     Okru: true, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
     GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
     // US (upns.online) no está soportado todavia.
-    // UA (unlimplay.com) descartado: agregador con anuncio previo y tokens firmados.
+    // UA (unlimplay.com) ahora soportado con el flujo de Kino (API vimeos.unlimplay.com + validacion de la lista).
     // LV (loadvid.com) descartado: devuelve el m3u8 como texto tras un token CSRF.
 };
 // ─────────────────────────────────────────────
@@ -468,6 +469,8 @@ function detectSource(url) {
         return "Playmate";
     if (host === "avcaption.com" || host.endsWith(".avcaption.com"))
         return "Avc";
+    if ((host === "unlimplay.com" || host.endsWith(".unlimplay.com")) && /\/f\/embed\//.test(url))
+        return "Ua";
     // Google Drive (drive.google.com / docs.google.com / drive.usercontent.google.com)
     if (driveId(url))
         return "Drive";
@@ -853,6 +856,54 @@ function extractAvc(embedUrl) {
         return { url: url, headers: { "Referer": "https://avcaption.com/", "User-Agent": UA }, type: "hls" };
     });
 }
+
+/**
+ * UA (https://unlimplay.com/f/embed/<movie|tv>/<id>) - portado del plugin de Kino.
+ * Pide a vimeos.unlimplay.com el manifiesto (latino > español > directo) y COMPRUEBA que sea una lista HLS valida;
+ * cada intento puede devolver un token distinto, asi que se reintenta unas veces si la lista no es valida.
+ */
+function extractUa(embedUrl) {
+    var m = /unlimplay\.com\/f\/embed\/([A-Za-z]+)\/(\d+)/.exec(String(embedUrl));
+    if (!m)
+        return Promise.reject(Error("UA: enlace incompleto"));
+    var type = (m[1] === "tv" || m[1] === "series" || m[1] === "serie") ? "tv" : "movie";
+    var id = m[2];
+    var apiHeaders = { "User-Agent": UA, "Origin": "https://unlimplay.com" };
+    var playHeaders = { "User-Agent": UA, "Referer": "https://videoapi.la/" };
+    var api = "https://vimeos.unlimplay.com/?id=" + encodeURIComponent(id) + "&type=" + encodeURIComponent(type);
+    var MAX_TRIES = 3;
+    var last = "";
+    function attempt(n) {
+        if (n >= MAX_TRIES)
+            return Promise.reject(Error("UA: no entregó una lista reproducible" + (last ? ": " + last : "")));
+        return fetch(api, { headers: apiHeaders }).then(function (r) {
+            if (!r.ok)
+                throw Error("UA: HTTP " + r.status);
+            return r.json();
+        }).then(function (j) {
+            var url = String((j && j.embeds && j.embeds.latino && j.embeds.latino.direct) ||
+                (j && j.embeds && j.embeds.espanol && j.embeds.espanol.direct) ||
+                (j && j.direct) || "");
+            if (!/^https:\/\//.test(url))
+                throw Error("UA: no entregó manifiesto");
+            return fetch(url, { headers: playHeaders }).then(function (r2) {
+                if (!r2.ok)
+                    throw new Error("la lista respondió " + r2.status);
+                return r2.text();
+            }).then(function (txt) {
+                if (String(txt).trim().slice(0, 64).indexOf("#EXTM3U") !== 0)
+                    throw new Error("no devolvió una lista de reproducción");
+                return { url: url, headers: playHeaders, type: "hls" };
+            });
+        }).then(null, function (e) {
+            if (/^UA: HTTP|^UA: no entregó manifiesto/.test(String(e && e.message)))
+                throw e; // fallo de la API: reintentar no ayuda
+            last = String((e && e.message) || e).slice(0, 80);
+            return attempt(n + 1);
+        });
+    }
+    return attempt(0);
+}
 /**
  * FC (https://<algo>.blogspot.com/?player=fluidplayer&provider=rand&format=video%2Fmp4&link=<url>)
  * No hace falta abrir nada: la URL directa del video ya viene codificada en el
@@ -884,11 +935,29 @@ function extractFC(embedUrl) {
             isHls = /mpegurl|m3u8/i.test(format) || /\.m3u8(\?|$)/i.test(link);
             origin = getOrigin(embedUrl);
             console.log("[FC] ".concat(isHls ? "HLS" : "MP4", ": ").concat(link));
-            return [2 /*return*/, {
-                    url: link,
-                    headers: { "Referer": "".concat(origin, "/"), "User-Agent": UA },
-                    type: isHls ? "hls" : "mp4"
-                }];
+            // Igual que el plugin de Kino: el destino DEBE terminar en extension de video (.mp4 .m4v .webm .mkv) o ser HLS.
+            // Si no, el enlace se descarta y Nuvio pasa al siguiente servidor.
+            var fcHasExt = isHls || /\.(mp4|m4v|webm|mkv)(\?|#|$)/i.test(link);
+            if (!fcHasExt)
+                throw Error("FC: el enlace no termina en formato de video (" + link.slice(0, 80) + ")");
+            var fcHeaders = { "Referer": "".concat(origin, "/"), "User-Agent": UA };
+            var fcOut = { url: link, headers: fcHeaders, type: isHls ? "hls" : "mp4" };
+            // Comprobacion rapida (1-2 bytes): si esta claramente muerto (404/410/5xx o una pagina HTML) se descarta.
+            // Un fallo de red o lentitud NO lo descarta.
+            return [2 /*return*/, fetch(link, { headers: __assign(__assign({}, fcHeaders), { "Range": "bytes=0-1" }) }).then(function (r) {
+                    var ct = "";
+                    try { ct = String((r.headers && r.headers.get && r.headers.get("content-type")) || ""); } catch (_) { }
+                    try { if (r.body && r.body.cancel) r.body.cancel(); } catch (_) { }
+                    console.log("[FC] comprobacion: " + r.status + " " + ct.split(";")[0]);
+                    if (r.status === 404 || r.status === 410 || r.status >= 500)
+                        throw Error("FC: el servidor respondió " + r.status);
+                    if (/text\/html|application\/json/i.test(ct))
+                        throw Error("FC: respondió una página, no un video");
+                    return fcOut;
+                }, function (e) {
+                    console.warn("[FC] no se pudo comprobar (" + e.message + "); se ofrece igualmente");
+                    return fcOut;
+                })];
         });
     });
 }
@@ -1206,6 +1275,7 @@ var ALL_SOURCES = {
     Avc: { label: "AVC", format: "HLS", extract: extractAvc },
     FC: { label: "FC", format: "MP4", extract: extractFC },
     Okru: { label: "OK.RU", format: "MP4/HLS", extract: extractOkru },
+    Ua: { label: "UA", format: "HLS", extract: extractUa },
     Vimeos: { label: "VIMEO", format: "HLS", extract: extractVimeos },
     GoodStream: { label: "GS", format: "HLS", extract: extractGoodStream },
     Drive: { label: "DRIVE", format: "MP4", extract: extractDrive }
