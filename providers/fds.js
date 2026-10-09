@@ -71,20 +71,15 @@ var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, l
 // Usa el `fetch` que Nuvio le entrega al plugin (no se busca en globalThis) y NO lo sobrescribe, para funcionar igual en celular y TV.
 var FETCH_TIMEOUT_MS = 12000;
 function fetchT(url, opts) {
-    opts = opts || {};
-    var ctrl = null, timer;
-    try { if (typeof AbortController !== "undefined") ctrl = new AbortController(); } catch (_) { ctrl = null; }
-    var o = {};
-    for (var k in opts) o[k] = opts[k];
-    if (ctrl && !o.signal) o.signal = ctrl.signal;
+    // OJO: NO se usa AbortController/`signal`. Algunos entornos de Nuvio (p. ej. el de la TV) pasan las opciones de fetch por un
+    // puente nativo que no admite objetos como `signal`, y la peticion fallaba siempre. Solo se corta la ESPERA (Promise.race);
+    // las opciones que llegan a fetch son exactamente las mismas que enviaba el plugin original.
+    var timer;
     var limit = new Promise(function (_, reject) {
-        timer = setTimeout(function () {
-            try { if (ctrl) ctrl.abort(); } catch (_) { }
-            reject(Error("fetch: tiempo agotado (" + FETCH_TIMEOUT_MS + " ms)"));
-        }, FETCH_TIMEOUT_MS);
+        timer = setTimeout(function () { reject(Error("fetch: tiempo agotado (" + FETCH_TIMEOUT_MS + " ms)")); }, FETCH_TIMEOUT_MS);
     });
     var req;
-    try { req = fetch(url, o); } catch (e) { clearTimeout(timer); return Promise.reject(e); }
+    try { req = opts === undefined ? fetch(url) : fetch(url, opts); } catch (e) { clearTimeout(timer); return Promise.reject(e); }
     return Promise.race([req, limit]).then(function (r) { clearTimeout(timer); return r; }, function (e) { clearTimeout(timer); throw e; });
 }
 // cache en memoria (10 min): reproducir el mismo titulo otra vez, o cambiar de servidor, ya no repite TMDB ni la busqueda en el feed
