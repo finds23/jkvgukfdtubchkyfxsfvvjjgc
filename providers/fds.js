@@ -1173,8 +1173,6 @@ function getQualityLabel(q) {
 function __buildLabel(source, server, rv, pageUrl) {
     var label = "\uD83D\uDCFA " + source.label + " (" + (rv.format || source.format) + ")\n" +
         (rv.quality || getQualityLabel(server.quality)) + " | WEB-DL\n" + getLangLabel(server.lang);
-    if (rv.note)
-        label += "\n" + rv.note;
     if (pageUrl)
         label += "\n\uD83D\uDD17 " + pageUrl;
     if (server.url)
