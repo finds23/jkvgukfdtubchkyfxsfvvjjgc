@@ -72,7 +72,7 @@ var ENABLED_SOURCES = {
     Videro: true, // "VR"   -> videro.my  (HLS vía API pública)
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
-    Okru: true, // "OK.RU" -> ok.ru (portado de pelisgo.js, donde funciona)
+    Okru: false, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
     GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
@@ -941,6 +941,81 @@ function jwFindFiles(texts) {
     out.sort(function (a, b) { return (/\.m3u8/.test(a) ? 0 : 1) - (/\.m3u8/.test(b) ? 0 : 1); });
     return out;
 }
+/**
+ * Comprueba el HLS como lo pediria el reproductor (lista -> variante -> primer fragmento) y prueba varias combinaciones de cabeceras.
+ * Devuelve las primeras que funcionan y una nota corta para la etiqueta del stream (asi se ve en Nuvio que respondio el servidor).
+ */
+function jwProbe(url, headers, range) {
+    var h = {};
+    for (var k in headers)
+        h[k] = headers[k];
+    if (range)
+        h["Range"] = "bytes=0-1";
+    return fetch(url, { headers: h }).then(function (r) {
+        var out = { status: r.status, text: "" };
+        if (!range)
+            return r.text().then(function (t) { out.text = String(t || "").slice(0, 8000); return out; });
+        try { if (r.body && r.body.cancel) r.body.cancel(); } catch (_) { }
+        return out;
+    }).catch(function (e) { return { status: "red", text: "", error: e && e.message }; });
+}
+function jwFirstUrl(text, base) {
+    var lines = String(text || "").split("\n").map(function (x) { return x.trim(); }).filter(function (x) { return x && x.charAt(0) !== "#"; });
+    if (!lines.length)
+        return "";
+    var l = lines[0];
+    if (/^https?:\/\//i.test(l))
+        return l;
+    var o = getOrigin(base);
+    if (l.charAt(0) === "/")
+        return o + l;
+    return base.replace(/[?#].*$/, "").replace(/[^\/]*$/, "") + l;
+}
+function jwCheckHls(url, headers) {
+    return jwProbe(url, headers, false).then(function (a) {
+        if (a.status !== 200 || !/#EXTM3U/.test(a.text))
+            return { ok: false, detail: "lista " + a.status };
+        var next = jwFirstUrl(a.text, url);
+        if (next && /\.m3u8/i.test(next))
+            return jwProbe(next, headers, false).then(function (b) {
+                if (b.status !== 200)
+                    return { ok: false, detail: "variante " + b.status };
+                var seg = jwFirstUrl(b.text, next);
+                if (!seg)
+                    return { ok: true, detail: "lista 200" };
+                return jwProbe(seg, headers, true).then(function (c) {
+                    return (c.status === 200 || c.status === 206) ? { ok: true, detail: "fragmento " + c.status } : { ok: false, detail: "fragmento " + c.status };
+                });
+            });
+        if (next)
+            return jwProbe(next, headers, true).then(function (c) {
+                return (c.status === 200 || c.status === 206) ? { ok: true, detail: "fragmento " + c.status } : { ok: false, detail: "fragmento " + c.status };
+            });
+        return { ok: true, detail: "lista 200" };
+    });
+}
+function jwPickHeaders(url, embedUrl, origin) {
+    var variants = [
+        { name: "A", headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } },
+        { name: "B", headers: { "Referer": embedUrl, "User-Agent": UA } },
+        { name: "C", headers: { "Referer": origin + "/", "User-Agent": UA } },
+        { name: "D", headers: { "User-Agent": UA } }
+    ];
+    var tried = [];
+    function next(i) {
+        if (i >= variants.length)
+            return Promise.resolve({ headers: variants[0].headers, note: "\u26A0 sin verificar (" + tried.join(", ") + ")" });
+        var v = variants[i];
+        return jwCheckHls(url, v.headers).then(function (r) {
+            console.log("[JW] cabeceras " + v.name + ": " + r.detail);
+            if (r.ok)
+                return { headers: v.headers, note: "\u2713 verificado (" + v.name + ": " + r.detail + ")" };
+            tried.push(v.name + ":" + r.detail);
+            return next(i + 1);
+        });
+    }
+    return next(0);
+}
 function extractJw(embedUrl, tag) {
     return __awaiter(this, void 0, void 0, function () {
         var origin, resp, html, files, url, isHls;
@@ -962,13 +1037,39 @@ function extractJw(embedUrl, tag) {
                     url = files[0];
                     isHls = /\.m3u8/i.test(url);
                     console.log("[" + tag + "] " + (isHls ? "HLS" : "MP4") + ": " + url);
-                    return [2 /*return*/, __assign({ url: url, headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } }, (isHls ? { type: "hls" } : {}))];
+                    if (!isHls)
+                        return [2 /*return*/, { url: url, headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": UA } }];
+                    return [2 /*return*/, jwPickHeaders(url, embedUrl, origin).then(function (pick) {
+                            return { url: url, headers: pick.headers, type: "hls", note: pick.note };
+                        })];
             }
         });
     });
 }
 function extractVimeos(embedUrl) { return extractJw(embedUrl, "VIMEO"); }
 function extractGoodStream(embedUrl) { return extractJw(embedUrl, "GS"); }
+/**
+ * Limite de tiempo por servidor: la lista de streams se devuelve cuando TODOS los extractores terminan, asi que un servidor
+ * lento o bloqueado (p. ej. GS detras de Cloudflare) retrasaba tambien a los demas (OK.RU "tardaba en conectar").
+ * Con el limite, el que no responde se descarta y el resto sale a tiempo. Tambien deja en el log cuanto tardo cada uno.
+ */
+var SOURCE_TIMEOUT_MS = 12000;
+function runSource(source, url, ctx) {
+    var t0 = Date.now();
+    var timer;
+    var limit = new Promise(function (_, reject) {
+        timer = setTimeout(function () { reject(Error("tiempo agotado (" + SOURCE_TIMEOUT_MS + " ms)")); }, SOURCE_TIMEOUT_MS);
+    });
+    return Promise.race([Promise.resolve().then(function () { return source.extract(url, ctx); }), limit]).then(function (r) {
+        clearTimeout(timer);
+        console.log("[" + source.label + "] OK en " + (Date.now() - t0) + " ms");
+        return r;
+    }, function (e) {
+        clearTimeout(timer);
+        console.warn("[" + source.label + "] fallo en " + (Date.now() - t0) + " ms: " + e.message);
+        throw e;
+    });
+}
 var ALL_SOURCES = {
     Vids: { label: "VST", format: "MP4", extract: extractVids },
     Videro: { label: "VR", format: "HLS", extract: extractVidero },
@@ -1043,7 +1144,7 @@ function __directEntry(postId) {
         var ctx = { titles: [stripYear(info.title)], year: extractYear(info.title), original: undefined };
         return Promise.all(servers.map(function (server) {
             var source = SOURCE_EXTRACTORS[server.sourceKey];
-            return Promise.resolve(source.extract(server.url, ctx)).then(function (resolved) {
+            return runSource(source, server.url, ctx).then(function (resolved) {
                 return (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
                     var label = __buildLabel(source, server, rv, info.url);
                     return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
@@ -1114,7 +1215,7 @@ var __getStreamsTmdb = function (tmdbId, type, season, episode) {
                                         _a.label = 1;
                                     case 1:
                                         _a.trys.push([1, 3, , 4]);
-                                        return [4 /*yield*/, source.extract(server.url, { titles: info.titles, year: info.year, original: info.original })];
+                                        return [4 /*yield*/, runSource(source, server.url, { titles: info.titles, year: info.year, original: info.original })];
                                     case 2:
                                         resolved = _a.sent();
                                         return [2 /*return*/, (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
