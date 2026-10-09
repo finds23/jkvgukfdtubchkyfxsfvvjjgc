@@ -1,12 +1,12 @@
 {
   "name": "fds",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "scrapers": [
     {
       "id": "fds",
       "name": "fds",
       "description": "fds",
-      "version": "1.1.8",
+      "version": "1.1.9",
       "author": "-",
       "supportedTypes": [
         "movie",
