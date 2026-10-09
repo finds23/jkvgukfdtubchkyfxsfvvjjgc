@@ -93,13 +93,13 @@ var ENABLED_SOURCES = {
     Vids: false, // "VST"  -> vids.st (DESACTIVADO: desde Nuvio no conecta con vids.st aunque el navegador si; poner true para probar de nuevo)
     Videro: true, // "VR"   -> videro.my  (HLS vía API pública)
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
-    Avc: true, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
+    Avc: false, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
     Ua: false, // "UA"   -> unlimplay.com (HLS validado, portado de Kino)
     Okru: false, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
-    GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
+    GoodStream: false, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
     // US (upns.online) no está soportado todavia.
     // UA (unlimplay.com) ahora soportado con el flujo de Kino (API vimeos.unlimplay.com + validacion de la lista).
     // LV (loadvid.com) descartado: devuelve el m3u8 como texto tras un token CSRF.
