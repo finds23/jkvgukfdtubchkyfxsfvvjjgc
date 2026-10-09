@@ -65,14 +65,42 @@ var PROVIDER_NAME = "fds"; // nombre visible en los logs y en la lista de stream
 var SITE_BASE = atob("aHR0cHM6Ly93d3cuZnVlZ29jaW5lLmNvbQ==");
 var TMDB_API_KEY = "56db0ec297530920213e1503706b81ff";
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// ── Mejoras de velocidad ─────────────────────────────────────────────
+// fetch con tiempo limite: antes una peticion colgada (TMDB, feed, embed) bloqueaba TODO hasta el limite del sistema.
+var _G = (typeof globalThis !== "undefined" ? globalThis : (typeof global !== "undefined" ? global : this));
+var _origFetch = (_G.fetch && _G.fetch.__fdsOrig) || _G.fetch;
+var FETCH_TIMEOUT_MS = 8000;
+function fetch(url, opts) {
+    opts = opts || {};
+    var ctrl = null, timer;
+    try { if (typeof AbortController !== "undefined") ctrl = new AbortController(); } catch (_) { }
+    var o = {};
+    for (var k in opts) o[k] = opts[k];
+    if (ctrl && !o.signal) o.signal = ctrl.signal;
+    var limit = new Promise(function (_, reject) {
+        timer = setTimeout(function () {
+            try { if (ctrl) ctrl.abort(); } catch (_) { }
+            reject(Error("fetch: tiempo agotado (" + FETCH_TIMEOUT_MS + " ms)"));
+        }, FETCH_TIMEOUT_MS);
+    });
+    return Promise.race([_origFetch(url, o), limit]).then(function (r) { clearTimeout(timer); return r; }, function (e) { clearTimeout(timer); throw e; });
+}
+fetch.__fdsOrig = _origFetch;
+// cache en memoria (10 min): reproducir el mismo titulo otra vez, o cambiar de servidor, ya no repite TMDB ni la busqueda en el feed
+var CACHE_TTL_MS = 10 * 60 * 1000;
+var _cache = {};
+function cacheGet(key) { var c = _cache[key]; return c && (Date.now() - c.t < CACHE_TTL_MS) ? c.v : undefined; }
+function cacheSet(key, v) { _cache[key] = { t: Date.now(), v: v }; return v; }
 // Switch de sources: true/false para activar o desactivar cada uno sin tocar
 // el resto del código.
 var ENABLED_SOURCES = {
     Vids: false, // "VST"  -> vids.st (DESACTIVADO: desde Nuvio no conecta con vids.st aunque el navegador si; poner true para probar de nuevo)
     Videro: true, // "VR"   -> videro.my  (HLS vía API pública)
     Playmate: true, // "PM"   -> playmate.to (HLS vía POST /api/s)
+    Avc: true, // "AVC"  -> avcaption.com (token + HLS, igual que en el plugin de Kino)
     FC: true, // "FC"   -> blogspot propio del sitio (el MP4 viene en el parámetro `link`)
-    Okru: false, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
+    Okru: true, // "OK.RU" -> ok.ru. APAGADO en el addon: ok.ru ata el enlace a la IP de quien abre la pagina (srcIp=) y en Render sale la IP de Render, asi que en el celular va lento/sin iniciar. Ponlo en true en la copia que corre dentro de Nuvio.
     Drive: true, // "DRIVE" -> drive.google.com (enlace directo de descarga; NO pasa por el proxy/Render)
     Vimeos: true, // "VIMEO" -> vimeos.net (OJO: no es vimeo.com; JW Player con script empaquetado y HLS)
     GoodStream: true, // "GS" -> goodstream.one y gscdn.cam (JW Player con HLS)
@@ -118,6 +146,11 @@ function extractYear(title) {
 // TMDB -> títulos de búsqueda
 // ─────────────────────────────────────────────
 function getTMDBTitles(tmdbId, type) {
+    var ck = "tmdb:" + type + ":" + tmdbId, hit = cacheGet(ck);
+    if (hit) return Promise.resolve(hit);
+    return _getTMDBTitles(tmdbId, type).then(function (r) { return r ? cacheSet(ck, r) : r; });
+}
+function _getTMDBTitles(tmdbId, type) {
     return __awaiter(this, void 0, void 0, function () {
         var path, fetchLang, _a, es, en, titles, seen, _i, _b, d, _c, _d, t, key, base, dateStr, year;
         var _this = this;
@@ -182,6 +215,11 @@ function getTMDBTitles(tmdbId, type) {
 // Feed JSON de Blogger
 // ─────────────────────────────────────────────
 function fetchFeed(path) {
+    var hit = cacheGet("feed:" + path);
+    if (hit) return Promise.resolve(hit);
+    return _fetchFeed(path).then(function (r) { return cacheSet("feed:" + path, r); });
+}
+function _fetchFeed(path) {
     return __awaiter(this, void 0, void 0, function () {
         var resp, data;
         return __generator(this, function (_a) {
@@ -428,6 +466,8 @@ function detectSource(url) {
         return "Videro";
     if (host === "playmate.to" || host.endsWith(".playmate.to"))
         return "Playmate";
+    if (host === "avcaption.com" || host.endsWith(".avcaption.com"))
+        return "Avc";
     // Google Drive (drive.google.com / docs.google.com / drive.usercontent.google.com)
     if (driveId(url))
         return "Drive";
@@ -669,7 +709,7 @@ function extractPlaymate(embedUrl) {
                     if (!origin || !id)
                         throw Error("PM: URL de embed inválida");
                     lastError = "sin respuesta";
-                    _i = 0, _a = ["android", "desktop"];
+                    _i = 0, _a = ["web", "android", "desktop"];
                     _b.label = 1;
                 case 1:
                     if (!(_i < _a.length)) return [3 /*break*/, 7];
@@ -769,13 +809,48 @@ function extractDrive(embedUrl) {
         if (ext)
             format = ext[1].toUpperCase();
         if (/text\/html/i.test(ct))
-            note = "\u26A0 Drive respondio una pagina (cuota/privado?)";
+            throw Error("DRIVE: Drive respondio una pagina (cuota/privado?)");
         console.log("[DRIVE] " + id + " -> " + r.status + " " + ct.split(";")[0] + " " + format);
         return { url: direct, headers: {}, format: format, note: note };
     }, function (e) {
         // Sin red hacia Google desde aqui: se entrega igual, lo abrira el reproductor
         console.warn("[DRIVE] No se pudo comprobar (" + e.message + "); se devuelve el enlace igualmente");
         return { url: direct, headers: {}, format: format, note: note };
+    });
+}
+
+/**
+ * AVC (https://avcaption.com/watch/<id>) - mismo flujo que el plugin de Kino:
+ * GET /api/stream/<id>/token devuelve `master_m3u8` (texto); se toma la variante de mayor BANDWIDTH.
+ */
+function extractAvc(embedUrl) {
+    var m = String(embedUrl).match(/\/watch\/([A-Za-z0-9]{16,64})/);
+    if (!m)
+        return Promise.reject(Error("AVC: identificador inválido"));
+    var H = { "User-Agent": UA, "Referer": "https://avcaption.com/", "Accept": "application/json" };
+    return fetch("https://avcaption.com/api/stream/" + m[1] + "/token", { headers: H })
+        .then(function (r) {
+        if (!r.ok)
+            throw Error("AVC: HTTP " + r.status);
+        return r.json();
+    }).then(function (j) {
+        var lines = String((j && j.master_m3u8) || "").split(/\r?\n/);
+        var best = null;
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf("#EXT-X-STREAM-INF") !== 0)
+                continue;
+            var next = String(lines[i + 1] || "").trim();
+            if (!next || next.charAt(0) === "#")
+                continue;
+            var bw = /BANDWIDTH=(\d+)/.exec(lines[i]);
+            var n = bw ? Number(bw[1]) : 0;
+            if (!best || n > best.bw)
+                best = { bw: n, url: next };
+        }
+        if (!best)
+            throw Error("AVC: no entregó variantes");
+        var url = /^https?:/.test(best.url) ? best.url : "https://avcaption.com" + (best.url.charAt(0) === "/" ? "" : "/") + best.url;
+        return { url: url, headers: { "Referer": "https://avcaption.com/", "User-Agent": UA }, type: "hls" };
     });
 }
 /**
@@ -1096,7 +1171,7 @@ function extractJw(embedUrl, tag) {
                 found.verified = false;
                 resolve(found);
             }
-        }, 9000);
+        }, 5000);
     });
     return Promise.race([main, soft]);
 }
@@ -1107,7 +1182,7 @@ function extractGoodStream(embedUrl) { return extractJw(embedUrl, "GS"); }
  * lento o bloqueado (p. ej. GS detras de Cloudflare) retrasaba tambien a los demas (OK.RU "tardaba en conectar").
  * Con el limite, el que no responde se descarta y el resto sale a tiempo. Tambien deja en el log cuanto tardo cada uno.
  */
-var SOURCE_TIMEOUT_MS = 12000;
+var SOURCE_TIMEOUT_MS = 7000;
 function runSource(source, url, ctx) {
     var t0 = Date.now();
     var timer;
@@ -1128,6 +1203,7 @@ var ALL_SOURCES = {
     Vids: { label: "VST", format: "MP4", extract: extractVids },
     Videro: { label: "VR", format: "HLS", extract: extractVidero },
     Playmate: { label: "PM", format: "HLS", extract: extractPlaymate },
+    Avc: { label: "AVC", format: "HLS", extract: extractAvc },
     FC: { label: "FC", format: "MP4", extract: extractFC },
     Okru: { label: "OK.RU", format: "MP4/HLS", extract: extractOkru },
     Vimeos: { label: "VIMEO", format: "HLS", extract: extractVimeos },
@@ -1180,6 +1256,52 @@ function __buildLabel(source, server, rv, pageUrl) {
     return label;
 }
 // Modo directo del addon (catalogo FuegoCine): "entry:<idPost>" lee esa entrada del feed y resuelve sus servidores, sin pasar por TMDB.
+/**
+ * Antes se esperaba a que TERMINARAN todos los servidores (Promise.all): un solo servidor lento retrasaba la lista entera.
+ * Ahora se devuelve en cuanto pasa EARLY_GRACE_MS desde que llego el primer enlace bueno (para dar chance a que
+ * lleguen un par mas), o cuando terminan todos, o al llegar a HARD_LIMIT_MS. El orden de salida sigue siendo el de
+ * ALL_SOURCES, no el de llegada.
+ */
+var EARLY_GRACE_MS = 2000;
+var HARD_LIMIT_MS = 8500;
+function gatherStreams(servers, ctx, pageUrl) {
+    return new Promise(function (resolve) {
+        var total = servers.length, done = 0, results = [], finished = false, grace = null, hard = null;
+        function finish() {
+            if (finished) return;
+            finished = true;
+            clearTimeout(grace);
+            clearTimeout(hard);
+            var out = [];
+            for (var k = 0; k < total; k++) if (results[k]) out = out.concat(results[k]);
+            console.log("[" + PROVIDER_NAME + "] \u2713 " + out.length + " streams devueltos (" + done + "/" + total + " servidores respondieron)");
+            resolve(out);
+        }
+        if (!total) return resolve([]);
+        hard = setTimeout(finish, HARD_LIMIT_MS);
+        servers.forEach(function (server, i) {
+            var source = SOURCE_EXTRACTORS[server.sourceKey];
+            runSource(source, server.url, ctx).then(function (resolved) {
+                results[i] = (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
+                    var label = __buildLabel(source, server, rv, pageUrl);
+                    return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
+                });
+            }, function () { results[i] = null; }).then(function () {
+                done++;
+                if (done >= total) return finish();
+                if (results[i] && results[i].length && !grace) grace = setTimeout(finish, EARLY_GRACE_MS);
+            });
+        });
+    });
+}
+function __serversOf(info) {
+    var servers = parseServerLinks(info.content)
+        .map(function (s) { return __assign(__assign({}, s), { sourceKey: detectSource(s.url) }); })
+        .filter(function (s) { return s.sourceKey && SOURCE_EXTRACTORS[s.sourceKey]; });
+    var order = Object.keys(SOURCE_EXTRACTORS);
+    servers.sort(function (a, b) { return order.indexOf(a.sourceKey) - order.indexOf(b.sourceKey); });
+    return servers;
+}
 function __directEntry(postId) {
     return fetch(SITE_BASE + "/feeds/posts/default/" + postId + "?alt=json", { headers: { "User-Agent": UA, "Accept": "application/json" } })
         .then(function (r) { if (!r.ok) throw Error("HTTP error! Status: " + r.status); return r.json(); })
@@ -1187,24 +1309,9 @@ function __directEntry(postId) {
         var e = d && d.entry;
         if (!e) return [];
         var info = entryInfo(e);
-        var servers = parseServerLinks(info.content)
-            .map(function (s) { return __assign(__assign({}, s), { sourceKey: detectSource(s.url) }); })
-            .filter(function (s) { return s.sourceKey && SOURCE_EXTRACTORS[s.sourceKey]; });
-        if (servers.length === 0) return [];
-        var order = Object.keys(SOURCE_EXTRACTORS);
-        servers.sort(function (a, b) { return order.indexOf(a.sourceKey) - order.indexOf(b.sourceKey); });
-        var ctx = { titles: [stripYear(info.title)], year: extractYear(info.title), original: undefined };
-        return Promise.all(servers.map(function (server) {
-            var source = SOURCE_EXTRACTORS[server.sourceKey];
-            return runSource(source, server.url, ctx).then(function (resolved) {
-                return (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
-                    var label = __buildLabel(source, server, rv, info.url);
-                    return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
-                });
-            }).catch(function () { return null; });
-        })).then(function (results) {
-            return results.filter(Boolean).reduce(function (acc, item) { return acc.concat(item); }, []);
-        });
+        var servers = __serversOf(info);
+        if (!servers.length) return [];
+        return gatherStreams(servers, { titles: [stripYear(info.title)], year: extractYear(info.title), original: undefined }, info.url);
     }).catch(function () { return []; });
 }
 exports.getStreams = function (tmdbId, type, season, episode) {
@@ -1212,87 +1319,23 @@ exports.getStreams = function (tmdbId, type, season, episode) {
     if (__pd) return __directEntry(__pd[1]);
     return __getStreamsTmdb(tmdbId, type, season, episode);
 };
-var __getStreamsTmdb = function (tmdbId, type, season, episode) {
-    return __awaiter(this, void 0, void 0, function () {
-        var info, entry, seasonNum, episodeNum, servers, order_1, results, final, e_4;
-        var _this = this;
-        return __generator(this, function (_a) {
-            switch (_a.label) {
-                case 0:
-                    if (!tmdbId || !type)
-                        return [2 /*return*/, []];
-                    console.log("[".concat(PROVIDER_NAME, "] Buscando: TMDB ").concat(tmdbId, " (").concat(type, ") S").concat(season !== null && season !== void 0 ? season : "-", "E").concat(episode !== null && episode !== void 0 ? episode : "-"));
-                    _a.label = 1;
-                case 1:
-                    _a.trys.push([1, 8, , 9]);
-                    return [4 /*yield*/, getTMDBTitles(tmdbId, type)];
-                case 2:
-                    info = _a.sent();
-                    if (!info || info.titles.length === 0)
-                        return [2 /*return*/, []];
-                    entry = void 0;
-                    if (!(type === "movie")) return [3 /*break*/, 4];
-                    return [4 /*yield*/, findMovieEntry(tmdbId, info.titles, info.year)];
-                case 3:
-                    entry = _a.sent();
-                    return [3 /*break*/, 6];
-                case 4:
-                    seasonNum = season ? Number(season) : 1;
-                    episodeNum = episode !== undefined && episode !== null ? Number(episode) : 1;
-                    return [4 /*yield*/, findEpisodeEntry(tmdbId, info.titles, seasonNum, episodeNum)];
-                case 5:
-                    entry = _a.sent();
-                    _a.label = 6;
-                case 6:
-                    if (!entry) {
-                        console.log("[".concat(PROVIDER_NAME, "] Sin entrada para \"").concat(info.titles[0], "\""));
-                        return [2 /*return*/, []];
-                    }
-                    console.log("[".concat(PROVIDER_NAME, "] Entrada elegida: \"").concat(entry.title, "\""));
-                    servers = parseServerLinks(entry.content)
-                        .map(function (s) { return (__assign(__assign({}, s), { sourceKey: detectSource(s.url) })); })
-                        .filter(function (s) { return s.sourceKey && SOURCE_EXTRACTORS[s.sourceKey]; });
-                    if (servers.length === 0) {
-                        console.warn("[".concat(PROVIDER_NAME, "] La entrada no tiene servidores soportados"));
-                        return [2 /*return*/, []];
-                    }
-                    order_1 = Object.keys(SOURCE_EXTRACTORS);
-                    servers.sort(function (a, b) { return order_1.indexOf(a.sourceKey) - order_1.indexOf(b.sourceKey); });
-                    return [4 /*yield*/, Promise.all(servers.map(function (server) { return __awaiter(_this, void 0, void 0, function () {
-                            var source, resolved, label, e_5;
-                            return __generator(this, function (_a) {
-                                switch (_a.label) {
-                                    case 0:
-                                        source = SOURCE_EXTRACTORS[server.sourceKey];
-                                        _a.label = 1;
-                                    case 1:
-                                        _a.trys.push([1, 3, , 4]);
-                                        return [4 /*yield*/, runSource(source, server.url, { titles: info.titles, year: info.year, original: info.original })];
-                                    case 2:
-                                        resolved = _a.sent();
-                                        return [2 /*return*/, (Array.isArray(resolved) ? resolved : [resolved]).map(function (rv) {
-                                                var label = __buildLabel(source, server, rv, entry.url);
-                                                return __assign({ name: PROVIDER_NAME, title: "", url: rv.url, quality: label, headers: rv.headers }, (rv.type ? { type: rv.type } : {}));
-                                            })];
-                                    case 3:
-                                        e_5 = _a.sent();
-                                        console.warn("[".concat(source.label, "] Fall\u00F3 resolviendo un servidor: ").concat(e_5.message));
-                                        return [2 /*return*/, null];
-                                    case 4: return [2 /*return*/];
-                                }
-                            });
-                        }); }))];
-                case 7:
-                    results = _a.sent();
-                    final = results.filter(Boolean).reduce(function (acc, item) { return acc.concat(item); }, []);
-                    console.log("[".concat(PROVIDER_NAME, "] \u2713 ").concat(final.length, " streams devueltos"));
-                    return [2 /*return*/, final];
-                case 8:
-                    e_4 = _a.sent();
-                    console.error("[".concat(PROVIDER_NAME, "] Error: ").concat(e_4.message));
-                    return [2 /*return*/, []];
-                case 9: return [2 /*return*/];
-            }
+function __getStreamsTmdb(tmdbId, type, season, episode) {
+    if (!tmdbId || !type) return Promise.resolve([]);
+    console.log("[" + PROVIDER_NAME + "] Buscando: TMDB " + tmdbId + " (" + type + ") S" + (season != null ? season : "-") + "E" + (episode != null ? episode : "-"));
+    return getTMDBTitles(tmdbId, type).then(function (info) {
+        if (!info || !info.titles.length) return [];
+        var finder = type === "movie"
+            ? findMovieEntry(tmdbId, info.titles, info.year)
+            : findEpisodeEntry(tmdbId, info.titles, season ? Number(season) : 1, episode !== undefined && episode !== null ? Number(episode) : 1);
+        return finder.then(function (entry) {
+            if (!entry) { console.log("[" + PROVIDER_NAME + "] Sin entrada para \"" + info.titles[0] + "\""); return []; }
+            console.log("[" + PROVIDER_NAME + "] Entrada elegida: \"" + entry.title + "\"");
+            var servers = __serversOf(entry);
+            if (!servers.length) { console.warn("[" + PROVIDER_NAME + "] La entrada no tiene servidores soportados"); return []; }
+            return gatherStreams(servers, { titles: info.titles, year: info.year, original: info.original }, entry.url);
         });
+    }).catch(function (e) {
+        console.error("[" + PROVIDER_NAME + "] Error: " + e.message);
+        return [];
     });
-};
+}
