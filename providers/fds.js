@@ -1054,24 +1054,28 @@ function extractJw(embedUrl, tag) {
     if (!origin)
         return Promise.reject(Error(tag + ": URL de embed inválida"));
     var uas = [{ ua: UA, label: "" }, { ua: OK_UA, label: "m" }];
+    // Lo primero que se encuentre queda aqui: si la comprobacion tarda demasiado se entrega igual (sin verificar) en vez de perder el servidor
+    var found = null;
     function attempt(i) {
         var ua = uas[i].ua;
         return fetch(embedUrl, { headers: { "User-Agent": ua, "Referer": SITE_BASE + "/", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } }).then(function (resp) {
             return resp.text().then(function (html) {
                 var files = jwFindFiles(jwTexts(html));
                 if (!files.length)
-                    throw Error(tag + ": no se encontró el video (HTTP " + resp.status + ", " + html.length + " bytes, packer=" + (/eval\(function\(p,a,c,k,e/.test(html) ? "si" : "no") + ", jwplayer=" + (/jwplayer/i.test(html) ? "si" : "no") + (/cloudflare|cf-chl|just a moment/i.test(html) ? ", CLOUDFLARE" : "") + ")");
+                    throw Error(tag + ": no se encontró el video (" + (i ? "movil " : "") + "HTTP " + resp.status + ", " + html.length + " bytes, packer=" + (/eval\(function\(p,a,c,k,e/.test(html) ? "si" : "no") + ", jwplayer=" + (/jwplayer/i.test(html) ? "si" : "no") + (/cloudflare|cf-chl|just a moment/i.test(html) ? ", CLOUDFLARE" : "") + ")");
                 var url = files[0];
                 if (!/\.m3u8/i.test(url))
                     return { url: url, headers: { "Referer": origin + "/", "Origin": origin, "User-Agent": ua } };
                 console.log("[" + tag + "] HLS: " + url);
+                if (!found)
+                    found = { url: url, headers: jwHeaders({ "Referer": origin + "/", "Origin": origin, "User-Agent": ua }), type: "hls" };
                 return jwPickHeaders(url, embedUrl, origin, ua, jwCookies(resp), uas[i].label).then(function (pick) {
                     return { url: url, headers: pick.headers, type: "hls", note: pick.note, verified: pick.verified };
                 });
             });
         });
     }
-    return attempt(0).then(function (r) {
+    var main = attempt(0).then(function (r) {
         if (r.verified !== false || !r.type)
             return r;
         // Con el User-Agent de escritorio no hubo suerte: se repite como navegador movil (el mismo que usa OK.RU)
@@ -1081,7 +1085,20 @@ function extractJw(embedUrl, tag) {
             r.note = r.note.replace(/\)$/, " | " + r2.note.replace(/^\u26A0 sin verificar \(/, "").replace(/\)$/, "") + ")");
             return r;
         }, function () { return r; });
+    }, function (e) {
+        // La pagina con User-Agent de escritorio no dio el video: se prueba como movil antes de rendirse
+        return attempt(1).catch(function (e2) { throw Error(e.message + " | " + e2.message); });
     });
+    var soft = new Promise(function (resolve, reject) {
+        setTimeout(function () {
+            if (found) {
+                found.note = "\u26A0 sin verificar (tiempo agotado)";
+                found.verified = false;
+                resolve(found);
+            }
+        }, 9000);
+    });
+    return Promise.race([main, soft]);
 }
 function extractVimeos(embedUrl) { return extractJw(embedUrl, "VIMEO"); }
 function extractGoodStream(embedUrl) { return extractJw(embedUrl, "GS"); }
