@@ -67,14 +67,13 @@ var TMDB_API_KEY = "56db0ec297530920213e1503706b81ff";
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // ── Mejoras de velocidad ─────────────────────────────────────────────
-// fetch con tiempo limite: antes una peticion colgada (TMDB, feed, embed) bloqueaba TODO hasta el limite del sistema.
-var _G = (typeof globalThis !== "undefined" ? globalThis : (typeof global !== "undefined" ? global : this));
-var _origFetch = (_G.fetch && _G.fetch.__fdsOrig) || _G.fetch;
-var FETCH_TIMEOUT_MS = 8000;
-function fetch(url, opts) {
+// fetchT = fetch con tiempo limite: antes una peticion colgada (TMDB, feed, embed) bloqueaba TODO hasta el limite del sistema.
+// Usa el `fetch` que Nuvio le entrega al plugin (no se busca en globalThis) y NO lo sobrescribe, para funcionar igual en celular y TV.
+var FETCH_TIMEOUT_MS = 12000;
+function fetchT(url, opts) {
     opts = opts || {};
     var ctrl = null, timer;
-    try { if (typeof AbortController !== "undefined") ctrl = new AbortController(); } catch (_) { }
+    try { if (typeof AbortController !== "undefined") ctrl = new AbortController(); } catch (_) { ctrl = null; }
     var o = {};
     for (var k in opts) o[k] = opts[k];
     if (ctrl && !o.signal) o.signal = ctrl.signal;
@@ -84,9 +83,10 @@ function fetch(url, opts) {
             reject(Error("fetch: tiempo agotado (" + FETCH_TIMEOUT_MS + " ms)"));
         }, FETCH_TIMEOUT_MS);
     });
-    return Promise.race([_origFetch(url, o), limit]).then(function (r) { clearTimeout(timer); return r; }, function (e) { clearTimeout(timer); throw e; });
+    var req;
+    try { req = fetch(url, o); } catch (e) { clearTimeout(timer); return Promise.reject(e); }
+    return Promise.race([req, limit]).then(function (r) { clearTimeout(timer); return r; }, function (e) { clearTimeout(timer); throw e; });
 }
-fetch.__fdsOrig = _origFetch;
 // cache en memoria (10 min): reproducir el mismo titulo otra vez, o cambiar de servidor, ya no repite TMDB ni la busqueda en el feed
 var CACHE_TTL_MS = 10 * 60 * 1000;
 var _cache = {};
@@ -166,7 +166,7 @@ function _getTMDBTitles(tmdbId, type) {
                                 case 0:
                                     _a.trys.push([0, 3, , 4]);
                                     url = "https://api.themoviedb.org/3/".concat(path, "/").concat(tmdbId, "?api_key=").concat(TMDB_API_KEY, "&language=").concat(lang);
-                                    return [4 /*yield*/, fetch(url, { headers: { "User-Agent": UA } })];
+                                    return [4 /*yield*/, fetchT(url, { headers: { "User-Agent": UA } })];
                                 case 1:
                                     resp = _a.sent();
                                     if (!resp.ok)
@@ -225,7 +225,7 @@ function _fetchFeed(path) {
         var resp, data;
         return __generator(this, function (_a) {
             switch (_a.label) {
-                case 0: return [4 /*yield*/, fetch("".concat(SITE_BASE).concat(path), {
+                case 0: return [4 /*yield*/, fetchT("".concat(SITE_BASE).concat(path), {
                         headers: { "User-Agent": UA, "Accept": "application/json" }
                     })];
                 case 1:
@@ -525,7 +525,7 @@ function vidsAttempt(url, headers, method, range) {
         h[k] = headers[k];
     if (range)
         h["Range"] = "bytes=0-1";
-    return fetch(url, { method: method, headers: h }).then(function (r) {
+    return fetchT(url, { method: method, headers: h }).then(function (r) {
         var ct = "";
         try {
             ct = (r.headers && r.headers.get && r.headers.get("content-type")) || "";
@@ -576,7 +576,7 @@ function extractVids(embedUrl, ctx) {
     var id = idMatch ? idMatch[1] : null;
     var headers = { "Referer": origin + "/", "User-Agent": UA };
     var embedNote = "embed ?";
-    return fetch(embedUrl, { headers: headers })
+    return fetchT(embedUrl, { headers: headers })
         .then(function (resp) {
         embedNote = "embed " + resp.status;
         return resp.ok ? resp.text() : "";
@@ -670,7 +670,7 @@ function extractVidero(embedUrl) {
                     idMatch = embedUrl.match(/\/e\/([^\/?#]+)/);
                     if (!origin || !idMatch)
                         throw Error("VR: URL de embed inválida");
-                    return [4 /*yield*/, fetch("".concat(origin, "/api/videos/public/").concat(idMatch[1]), {
+                    return [4 /*yield*/, fetchT("".concat(origin, "/api/videos/public/").concat(idMatch[1]), {
                             headers: { "User-Agent": UA, "Referer": embedUrl, "Accept": "application/json" }
                         })];
                 case 1:
@@ -720,7 +720,7 @@ function extractPlaymate(embedUrl) {
                     _b.label = 2;
                 case 2:
                     _b.trys.push([2, 5, , 6]);
-                    return [4 /*yield*/, fetch("".concat(origin, "/api/s"), {
+                    return [4 /*yield*/, fetchT("".concat(origin, "/api/s"), {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
@@ -792,7 +792,7 @@ function extractDrive(embedUrl) {
     var direct = "https://drive.usercontent.google.com/download?id=" + id + "&export=download&confirm=t";
     var note = "";
     var format = "MP4";
-    return fetch(direct, { method: "GET", headers: { "User-Agent": UA, "Range": "bytes=0-0" } })
+    return fetchT(direct, { method: "GET", headers: { "User-Agent": UA, "Range": "bytes=0-0" } })
         .then(function (r) {
         var ct = "";
         var cd = "";
@@ -831,7 +831,7 @@ function extractAvc(embedUrl) {
     if (!m)
         return Promise.reject(Error("AVC: identificador inválido"));
     var H = { "User-Agent": UA, "Referer": "https://avcaption.com/", "Accept": "application/json" };
-    return fetch("https://avcaption.com/api/stream/" + m[1] + "/token", { headers: H })
+    return fetchT("https://avcaption.com/api/stream/" + m[1] + "/token", { headers: H })
         .then(function (r) {
         if (!r.ok)
             throw Error("AVC: HTTP " + r.status);
@@ -876,7 +876,7 @@ function extractUa(embedUrl) {
     function attempt(n) {
         if (n >= MAX_TRIES)
             return Promise.reject(Error("UA: no entregó una lista reproducible" + (last ? ": " + last : "")));
-        return fetch(api, { headers: apiHeaders }).then(function (r) {
+        return fetchT(api, { headers: apiHeaders }).then(function (r) {
             if (!r.ok)
                 throw Error("UA: HTTP " + r.status);
             return r.json();
@@ -886,7 +886,7 @@ function extractUa(embedUrl) {
                 (j && j.direct) || "");
             if (!/^https:\/\//.test(url))
                 throw Error("UA: no entregó manifiesto");
-            return fetch(url, { headers: playHeaders }).then(function (r2) {
+            return fetchT(url, { headers: playHeaders }).then(function (r2) {
                 if (!r2.ok)
                     throw new Error("la lista respondió " + r2.status);
                 return r2.text();
@@ -944,7 +944,7 @@ function extractFC(embedUrl) {
             var fcOut = { url: link, headers: fcHeaders, type: isHls ? "hls" : "mp4" };
             // Comprobacion rapida (1-2 bytes): si esta claramente muerto (404/410/5xx o una pagina HTML) se descarta.
             // Un fallo de red o lentitud NO lo descarta.
-            return [2 /*return*/, fetch(link, { headers: __assign(__assign({}, fcHeaders), { "Range": "bytes=0-1" }) }).then(function (r) {
+            return [2 /*return*/, fetchT(link, { headers: __assign(__assign({}, fcHeaders), { "Range": "bytes=0-1" }) }).then(function (r) {
                     var ct = "";
                     try { ct = String((r.headers && r.headers.get && r.headers.get("content-type")) || ""); } catch (_) { }
                     try { if (r.body && r.body.cancel) r.body.cancel(); } catch (_) { }
@@ -983,8 +983,6 @@ function parseOkru(html) {
     var out = [];
     if (meta) {
         var hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls;
-        if (hls)
-            out.push({ url: hls, type: "hls", format: "HLS", quality: "Auto (HLS)" });
         var vids = (meta.videos || []).filter(function (v) { return v && v.url; });
         vids.sort(function (a, b) { return OK_QUALITY.indexOf(b.name) - OK_QUALITY.indexOf(a.name); });
         function okMp4(v) { return { url: v.url, format: "MP4", quality: OK_RES[v.name] || String(v.name) }; }
@@ -994,6 +992,10 @@ function parseOkru(html) {
         var full = vids.filter(function (v) { return v.name === "full"; })[0];
         if (vids[0] && full && vids[0] !== full)
             out.push(okMp4(full));
+        // El HLS "Auto" arranca en una calidad baja y sube despues: va DESPUES de los MP4 (calidad fija y mas alta),
+        // asi el autoreproducir elige primero el MP4 de mejor calidad.
+        if (hls)
+            out.push({ url: hls, type: "hls", format: "HLS", quality: "Auto (HLS)" });
         return out;
     }
     var txt = okDecode(html).replace(/\\u0026/g, "&").replace(/\\\//g, "/");
@@ -1005,7 +1007,7 @@ function parseOkru(html) {
 function extractOkru(embedUrl) {
     if (embedUrl.indexOf("//") === 0)
         embedUrl = "https:" + embedUrl;
-    return fetch(embedUrl, { headers: { "User-Agent": OK_UA, "Referer": SITE_BASE + "/" } })
+    return fetchT(embedUrl, { headers: { "User-Agent": OK_UA, "Referer": SITE_BASE + "/" } })
         .then(function (r) {
         if (!r.ok)
             throw Error("OK.RU: HTTP " + r.status);
@@ -1105,7 +1107,7 @@ function jwProbe(url, headers, range) {
         h[k] = headers[k];
     if (range)
         h["Range"] = "bytes=0-1";
-    return fetch(url, { headers: h }).then(function (r) {
+    return fetchT(url, { headers: h }).then(function (r) {
         var out = { status: r.status, text: "", server: "", cf: "" };
         try {
             out.server = String((r.headers && r.headers.get && r.headers.get("server")) || "");
@@ -1202,7 +1204,7 @@ function extractJw(embedUrl, tag) {
     var found = null;
     function attempt(i) {
         var ua = uas[i].ua;
-        return fetch(embedUrl, { headers: { "User-Agent": ua, "Referer": SITE_BASE + "/", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } }).then(function (resp) {
+        return fetchT(embedUrl, { headers: { "User-Agent": ua, "Referer": SITE_BASE + "/", "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "es-419,es;q=0.9" } }).then(function (resp) {
             return resp.text().then(function (html) {
                 var files = jwFindFiles(jwTexts(html));
                 if (!files.length)
@@ -1240,7 +1242,7 @@ function extractJw(embedUrl, tag) {
                 found.verified = false;
                 resolve(found);
             }
-        }, 5000);
+        }, 7000);
     });
     return Promise.race([main, soft]);
 }
@@ -1251,7 +1253,7 @@ function extractGoodStream(embedUrl) { return extractJw(embedUrl, "GS"); }
  * lento o bloqueado (p. ej. GS detras de Cloudflare) retrasaba tambien a los demas (OK.RU "tardaba en conectar").
  * Con el limite, el que no responde se descarta y el resto sale a tiempo. Tambien deja en el log cuanto tardo cada uno.
  */
-var SOURCE_TIMEOUT_MS = 7000;
+var SOURCE_TIMEOUT_MS = 12000;
 function runSource(source, url, ctx) {
     var t0 = Date.now();
     var timer;
@@ -1333,7 +1335,7 @@ function __buildLabel(source, server, rv, pageUrl) {
  * ALL_SOURCES, no el de llegada.
  */
 var EARLY_GRACE_MS = 2000;
-var HARD_LIMIT_MS = 8500;
+var HARD_LIMIT_MS = 15000;
 function gatherStreams(servers, ctx, pageUrl) {
     return new Promise(function (resolve) {
         var total = servers.length, done = 0, results = [], finished = false, grace = null, hard = null;
@@ -1373,7 +1375,7 @@ function __serversOf(info) {
     return servers;
 }
 function __directEntry(postId) {
-    return fetch(SITE_BASE + "/feeds/posts/default/" + postId + "?alt=json", { headers: { "User-Agent": UA, "Accept": "application/json" } })
+    return fetchT(SITE_BASE + "/feeds/posts/default/" + postId + "?alt=json", { headers: { "User-Agent": UA, "Accept": "application/json" } })
         .then(function (r) { if (!r.ok) throw Error("HTTP error! Status: " + r.status); return r.json(); })
         .then(function (d) {
         var e = d && d.entry;
